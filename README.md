@@ -1,8 +1,24 @@
-# Voice Studio — Kokoro 82M (MLX) & Chatterbox MLX
+# Timbra — Local Voice Design, Cloning & App Narration Studio
 
-A 100% local, zero-API-key **Voice Design, Cloning & Studio Mastering Console** built for Apple Silicon Macs.
+A 100% local, zero-API-key **Voice Design, Cloning, Mastering & App Narration Console** built for Apple Silicon Macs.
 
-Runs **Kokoro-82M** natively on Apple Silicon Metal GPU via MLX (**~10× faster than real time**) alongside **Chatterbox MLX** for expressive acting and zero-shot voice & accent cloning — all connected to a real-time **Studio Mastering** and **Vocal Humanizer** DSP chain.
+Runs **Kokoro-82M** natively on Apple Silicon Metal GPU via MLX (**~10× faster than real time**) alongside **Chatterbox MLX** for expressive acting and zero-shot voice & accent cloning — with a built-in **OpenAI-compatible `/v1/audio/speech` API** and downloadable voice packs so any app can narrate using your custom voices.
+
+---
+
+## Using Exported Voices in Your Apps
+
+Click **Export Voice** in the top bar to register any Kokoro or Chatterbox voice under a clean voice slug (e.g. `warm-radio-host`):
+
+1. **OpenAI-Compatible Local Narration API (`POST /v1/audio/speech`)** — Drop-in support for Open WebUI, SillyTavern, Obsidian, Raycast, Swift macOS apps, Electron/React apps, and the official OpenAI SDK (`wav`, `mp3`, `flac`, `ogg`, `pcm`).
+   ```bash
+   curl http://127.0.0.1:8765/v1/audio/speech \
+     -H "Content-Type: application/json" \
+     -d '{"model":"timbra","voice":"warm-radio-host","input":"Hello from my app!","response_format":"mp3"}' \
+     --output narration.mp3
+   ```
+2. **Downloadable App Bundle (`.zip`)** — Self-contained `narrate.py` + `dsp.py` + `voice.timbra.json` + baked `(510, 1, 256)` `style.npy` (Kokoro) or `reference.wav` (Chatterbox).
+3. **Portable `.timbra.json` & Baked `.npy` Tensor** — Share/import voice configs or load the baked Kokoro style tensor directly with `np.load()`.
 
 ---
 

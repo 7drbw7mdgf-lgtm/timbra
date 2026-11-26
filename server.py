@@ -17,13 +17,20 @@ from typing import Any
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from kokoro_onnx import Kokoro
 from pydantic import BaseModel, Field
 from scipy import signal
 
 from dsp import MasteringParams, analyze_voice_profile, apply_mastering, compute_waveform_peaks
+from voice_export import (
+    build_zip_bundle,
+    delete_exported_voice,
+    list_exported_voices,
+    load_exported_voice,
+    save_exported_voice,
+)
 from voices_meta import DEFAULT_PRESETS, build_voice_catalog
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1287,6 +1294,359 @@ def synthesize_chatterbox(req: ChatterboxSynthesizeRequest) -> dict[str, Any]:
         "processed_text": processed_text,
         "phonemes": "",
     }
+
+
+# ---------- Voice Export & OpenAI-Compatible App Narration API (/v1/audio/speech) ----------
+
+class ExportVoiceRequest(BaseModel):
+    name: str
+    slug: str | None = None
+    description: str = ""
+    engine: str = "kokoro"  # 'kokoro' | 'chatterbox'
+    config: dict[str, Any]
+    pronunciation_rules: list[PronunciationRule] = Field(default_factory=list)
+
+
+class OpenAISpeechRequest(BaseModel):
+    model: str = "timbra"
+    input: str
+    voice: str = "eleven-warm-host"
+    response_format: str = "wav"  # wav | mp3 | flac | ogg | pcm
+    speed: float = Field(default=1.0, ge=0.5, le=2.0)
+
+
+def _encode_audio_bytes(audio: np.ndarray, sr: int, fmt: str) -> tuple[bytes, str]:
+    f = (fmt or "wav").lower().strip()
+    x = np.asarray(audio, dtype=np.float32)
+    if f == "pcm":
+        pcm16 = np.clip(x * 32767.0, -32768, 32767).astype("<i2")
+        return pcm16.tobytes(), "audio/pcm"
+
+    buf = io.BytesIO()
+    if f == "mp3":
+        sf.write(buf, x, sr, format="MP3")
+        return buf.getvalue(), "audio/mpeg"
+    if f == "flac":
+        sf.write(buf, x, sr, format="FLAC", subtype="PCM_16")
+        return buf.getvalue(), "audio/flac"
+    if f in ("ogg", "opus"):
+        sf.write(buf, x, sr, format="OGG", subtype="VORBIS")
+        return buf.getvalue(), "audio/ogg"
+    sf.write(buf, x, sr, format="WAV", subtype="PCM_16")
+    return buf.getvalue(), "audio/wav"
+
+
+def _build_style_from_config_dict(cfg: dict[str, Any]) -> tuple[np.ndarray, str]:
+    blend_items = [
+        VoiceWeight(voice=b["voice"], weight=float(b["weight"]))
+        for b in cfg.get("blend", [])
+        if isinstance(b, dict) and "voice" in b
+    ]
+    dummy = SynthesizeRequest(
+        text="x",
+        lang=cfg.get("lang", "en-us"),
+        blend=blend_items or [VoiceWeight(voice="af_heart", weight=1.0)],
+        split_mode=bool(cfg.get("split_mode", False)),
+        prosody_voice=str(cfg.get("prosody_voice", "af_heart")),
+        prosody_intensity=float(cfg.get("prosody_intensity", 1.0)),
+        style_offset=int(cfg.get("style_offset", 0)),
+    )
+    return _build_style_tensor(dummy)
+
+
+def _mastering_from_dict(m: dict[str, Any] | None) -> MasteringParams:
+    if not m:
+        return MasteringParams()
+    req = MasteringRequest(**{k: v for k, v in m.items() if k in MasteringRequest.model_fields})
+    return _to_mastering_params(req)
+
+
+@app.get("/api/exported-voices")
+def get_exported_voices() -> dict[str, Any]:
+    return {"voices": list_exported_voices()}
+
+
+@app.post("/api/exported-voices")
+def create_exported_voice(req: ExportVoiceRequest) -> dict[str, Any]:
+    if not req.name.strip():
+        raise HTTPException(status_code=400, detail="Please give your exported voice a name.")
+
+    engine = "chatterbox" if req.engine == "chatterbox" else "kokoro"
+    style_tensor: np.ndarray | None = None
+    ref_wav_path: Path | None = None
+
+    if engine == "kokoro":
+        if kokoro is None:
+            raise HTTPException(status_code=503, detail="Kokoro engine not ready.")
+        style_tensor, _ = _build_style_from_config_dict(req.config)
+    else:
+        ref_id = req.config.get("ref_id")
+        if ref_id:
+            candidate = REFERENCES_DIR / f"{Path(str(ref_id)).name}.wav"
+            if candidate.exists():
+                ref_wav_path = candidate
+
+    rules_dicts = [{"find": r.find, "replace": r.replace} for r in req.pronunciation_rules if r.find.strip()]
+    saved = save_exported_voice(
+        name=req.name,
+        description=req.description,
+        engine=engine,
+        config=req.config,
+        pronunciation_rules=rules_dicts,
+        style_tensor=style_tensor,
+        reference_wav_path=ref_wav_path,
+        slug_override=req.slug,
+    )
+    return {"voice": saved}
+
+
+@app.post("/api/exported-voices/import")
+async def import_exported_voice(request: Request) -> dict[str, Any]:
+    """Import a portable .timbra.json voice file back into Timbra."""
+    raw = await request.body()
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid .timbra.json file.")
+    if not isinstance(data, dict) or "config" not in data:
+        raise HTTPException(status_code=400, detail="Not a valid Timbra voice profile.")
+
+    engine = "chatterbox" if data.get("engine") == "chatterbox" else "kokoro"
+    style_tensor: np.ndarray | None = None
+    if engine == "kokoro" and kokoro is not None:
+        style_tensor, _ = _build_style_from_config_dict(data["config"])
+
+    saved = save_exported_voice(
+        name=str(data.get("name") or data.get("slug") or "Imported Voice"),
+        description=str(data.get("description") or ""),
+        engine=engine,
+        config=data["config"],
+        pronunciation_rules=data.get("pronunciation_rules") or [],
+        style_tensor=style_tensor,
+        slug_override=data.get("slug"),
+    )
+    return {"voice": saved}
+
+
+@app.delete("/api/exported-voices/{slug}")
+def remove_exported_voice(slug: str) -> dict[str, Any]:
+    if not delete_exported_voice(slug):
+        raise HTTPException(status_code=404, detail="Exported voice not found.")
+    return {"deleted": slug}
+
+
+@app.get("/api/exported-voices/{slug}/json")
+def download_exported_json(slug: str) -> Response:
+    loaded = load_exported_voice(slug)
+    if loaded is None:
+        raise HTTPException(status_code=404, detail="Exported voice not found.")
+    data, _ = loaded
+    return Response(
+        content=json.dumps(data, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{data["slug"]}.timbra.json"'},
+    )
+
+
+@app.get("/api/exported-voices/{slug}/style.npy")
+def download_exported_npy(slug: str) -> FileResponse:
+    loaded = load_exported_voice(slug)
+    if loaded is None:
+        raise HTTPException(status_code=404, detail="Exported voice not found.")
+    data, voice_dir = loaded
+    npy_path = voice_dir / "style.npy"
+    if not npy_path.exists():
+        raise HTTPException(status_code=404, detail="Baked Kokoro style.npy is only available for Kokoro voices.")
+    return FileResponse(
+        str(npy_path),
+        media_type="application/octet-stream",
+        filename=f"{data['slug']}_style.npy",
+    )
+
+
+@app.get("/api/exported-voices/{slug}/bundle.zip")
+def download_exported_bundle(slug: str) -> Response:
+    zip_bytes = build_zip_bundle(slug)
+    if zip_bytes is None:
+        raise HTTPException(status_code=404, detail="Exported voice not found.")
+    safe = Path(slug).name
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{safe}-timbra-pack.zip"'},
+    )
+
+
+@app.get("/v1/audio/voices")
+def openai_list_voices() -> dict[str, Any]:
+    """List all custom exported voices, curated presets, and built-in Kokoro voices."""
+    exported = [
+        {"id": v["slug"], "name": v["name"], "engine": v["engine"], "source": "exported"}
+        for v in list_exported_voices()
+    ]
+    presets = [
+        {"id": p["id"], "name": p["name"], "engine": "kokoro", "source": "preset"}
+        for p in DEFAULT_PRESETS + _load_custom_presets()
+    ]
+    raw_kokoro = [
+        {"id": v["id"], "name": v["name"], "engine": "kokoro", "source": "kokoro"}
+        for v in voice_catalog
+    ]
+    return {"voices": exported + presets + raw_kokoro}
+
+
+@app.post("/v1/audio/speech")
+def openai_audio_speech(req: OpenAISpeechRequest) -> Response:
+    """OpenAI-compatible TTS endpoint so any external app can narrate with Timbra voices."""
+    text = req.input.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Input text cannot be empty.")
+
+    voice_id = req.voice.strip()
+    exported = load_exported_voice(voice_id)
+
+    # 1. Custom exported Timbra voice (Kokoro or Chatterbox!)
+    if exported is not None:
+        vdata, voice_dir = exported
+        cfg = vdata.get("config", {})
+        rules = [
+            PronunciationRule(find=r["find"], replace=r["replace"])
+            for r in vdata.get("pronunciation_rules", [])
+            if isinstance(r, dict) and r.get("find")
+        ]
+        processed = _preprocess_text(text, bool(cfg.get("smart_punctuation", True)), rules)
+        m_params = _mastering_from_dict(cfg.get("mastering"))
+
+        if vdata.get("engine") == "chatterbox":
+            model = _get_chatterbox()
+            sr = int(getattr(model, "sample_rate", SAMPLE_RATE))
+            ref_file = voice_dir / "reference.wav"
+            with chatterbox_lock:
+                if ref_file.exists():
+                    import mlx.core as mx
+                    wav, rsr = sf.read(str(ref_file), dtype="float32")
+                    if wav.ndim > 1:
+                        wav = np.mean(wav, axis=1)
+                    conds = model.prepare_conditionals(
+                        mx.array(wav.astype(np.float32)),
+                        int(rsr),
+                        exaggeration=float(cfg.get("exaggeration", 0.55)),
+                    )
+                else:
+                    conds, _ = _get_chatterbox_conds(model, cfg.get("ref_id"), float(cfg.get("exaggeration", 0.55)))
+
+                para_chunks = _chunk_text_for_chatterbox(processed)
+                segs: list[np.ndarray] = []
+                sent_p = float(cfg.get("sentence_pause", 0.30))
+                para_p = float(cfg.get("paragraph_pause", 0.60))
+                for pi, sents in enumerate(para_chunks):
+                    for si, chunk_txt in enumerate(sents):
+                        parts = [
+                            np.asarray(res.audio, dtype=np.float32).ravel()
+                            for res in model.generate(
+                                text=chunk_txt,
+                                conds=conds,
+                                exaggeration=float(cfg.get("exaggeration", 0.55)),
+                                cfg_weight=float(cfg.get("cfg_weight", 0.50)),
+                                temperature=float(cfg.get("temperature", 0.80)),
+                                repetition_penalty=float(cfg.get("repetition_penalty", 1.20)),
+                                verbose=False,
+                            )
+                        ]
+                        if parts:
+                            segs.append(_fade_edges(np.concatenate(parts), sr, ms=6.0))
+                        if si < len(sents) - 1 and sent_p > 0:
+                            segs.append(np.zeros(int(sent_p * sr), dtype=np.float32))
+                    if pi < len(para_chunks) - 1 and para_p > 0:
+                        segs.append(np.zeros(int(para_p * sr), dtype=np.float32))
+                dry = np.concatenate(segs) if segs else np.zeros(0, dtype=np.float32)
+            mastered = apply_mastering(dry, sr, m_params)
+            payload_bytes, mime = _encode_audio_bytes(mastered, sr, req.response_format)
+            return Response(content=payload_bytes, media_type=mime)
+
+        # Exported Kokoro voice (load baked style.npy if present, else rebuild)
+        if kokoro is None:
+            raise HTTPException(status_code=503, detail="Kokoro engine not ready.")
+        npy_path = voice_dir / "style.npy"
+        if npy_path.exists():
+            style = np.load(str(npy_path)).astype(np.float32)
+        else:
+            style, _ = _build_style_from_config_dict(cfg)
+
+        eff_speed = float(np.clip(float(cfg.get("speed", 0.92)) * float(req.speed), 0.55, 1.65))
+        rh = float(cfg.get("rhythm_humanize", 0.30)) if m_params.humanize_enabled else 0.0
+        dry, sr, _ = _synthesize_paragraphs(
+            processed,
+            style=style,
+            speed=eff_speed,
+            lang=str(cfg.get("lang", "en-us")),
+            sentence_pause=float(cfg.get("sentence_pause", 0.35)),
+            clause_pause=float(cfg.get("clause_pause", 0.14)),
+            paragraph_pause=float(cfg.get("paragraph_pause", 0.65)),
+            continuous=bool(cfg.get("continuous", True)),
+            is_phonemes=False,
+            rhythm_humanize=rh,
+        )
+        mastered = apply_mastering(dry, sr, m_params)
+        payload_bytes, mime = _encode_audio_bytes(mastered, sr, req.response_format)
+        return Response(content=payload_bytes, media_type=mime)
+
+    # 2. Built-in or custom preset ID
+    all_presets = DEFAULT_PRESETS + _load_custom_presets()
+    preset = next((p for p in all_presets if p.get("id") == voice_id), None)
+    if preset is not None and kokoro is not None:
+        cfg = preset["config"]
+        style, _ = _build_style_from_config_dict(cfg)
+        m_params = _mastering_from_dict(cfg.get("mastering"))
+        processed = _preprocess_text(text, bool(cfg.get("smart_punctuation", True)), [])
+        eff_speed = float(np.clip(float(cfg.get("speed", 0.92)) * float(req.speed), 0.55, 1.65))
+        dry, sr, _ = _synthesize_paragraphs(
+            processed,
+            style=style,
+            speed=eff_speed,
+            lang=str(cfg.get("lang", "en-us")),
+            sentence_pause=float(cfg.get("sentence_pause", 0.35)),
+            clause_pause=float(cfg.get("clause_pause", 0.14)),
+            paragraph_pause=float(cfg.get("paragraph_pause", 0.65)),
+            continuous=bool(cfg.get("continuous", True)),
+            is_phonemes=False,
+            rhythm_humanize=0.25 if m_params.humanize_enabled else 0.0,
+        )
+        mastered = apply_mastering(dry, sr, m_params)
+        payload_bytes, mime = _encode_audio_bytes(mastered, sr, req.response_format)
+        return Response(content=payload_bytes, media_type=mime)
+
+    # 3. Direct raw Kokoro voice ID (or default af_heart fallback for OpenAI names like alloy/nova)
+    if kokoro is None:
+        raise HTTPException(status_code=503, detail="Kokoro engine not ready.")
+    openai_alias = {
+        "alloy": "af_alloy",
+        "echo": "am_echo",
+        "fable": "bm_fable",
+        "onyx": "am_onyx",
+        "nova": "af_nova",
+        "shimmer": "af_heart",
+    }
+    resolved_voice = openai_alias.get(voice_id.lower(), voice_id)
+    if resolved_voice not in kokoro.voices.files:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Voice '{voice_id}' not found. Export a voice in Timbra or inspect GET /v1/audio/voices.",
+        )
+    lang = "en-gb" if resolved_voice.startswith(("bf_", "bm_")) else "en-us"
+    dry, sr, _ = _synthesize_paragraphs(
+        text,
+        style=resolved_voice,
+        speed=float(np.clip(req.speed, 0.55, 1.65)),
+        lang=lang,
+        sentence_pause=0.30,
+        clause_pause=0.12,
+        paragraph_pause=0.55,
+        continuous=True,
+        is_phonemes=False,
+    )
+    payload_bytes, mime = _encode_audio_bytes(dry, sr, req.response_format)
+    return Response(content=payload_bytes, media_type=mime)
 
 
 @app.get("/api/audio/{filename}")

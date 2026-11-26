@@ -70,6 +70,9 @@ const state = {
   references: [],
   activeRefId: null, // null -> Chatterbox built-in default
   activeCbPresetId: "cb-natural",
+  exportedVoices: [],
+  selectedExportSlug: null,
+  exportCodeTab: "curl",
   voices: [],
   voiceMap: {},
   presets: [],
@@ -1302,6 +1305,243 @@ async function refreshPhonemes() {
   }
 }
 
+// ---------- Export Voice for Apps ----------
+
+function readCurrentEngineConfigForExport() {
+  if (state.engine === "chatterbox") {
+    return {
+      ref_id: state.activeRefId,
+      exaggeration: parseFloat($("cbExagSlider").value),
+      cfg_weight: parseFloat($("cbCfgSlider").value),
+      temperature: parseFloat($("cbTempSlider").value),
+      repetition_penalty: parseFloat($("cbRepSlider").value),
+      sentence_pause: parseFloat($("sentencePauseSlider").value),
+      paragraph_pause: parseFloat($("paragraphPauseSlider").value),
+      rhythm_humanize: parseFloat($("rhythmHumanizeSlider").value),
+      smart_punctuation: $("smartPuncCheck").checked,
+      mastering: readMasteringConfig(),
+    };
+  }
+  return readFullConfig();
+}
+
+async function loadExportedVoices() {
+  try {
+    const res = await fetch("/api/exported-voices");
+    if (!res.ok) return;
+    const data = await res.json();
+    state.exportedVoices = data.voices || [];
+    if (!state.selectedExportSlug && state.exportedVoices.length > 0) {
+      state.selectedExportSlug = state.exportedVoices[0].slug;
+    }
+    renderExportedVoices();
+    renderExportSnippet();
+  } catch (_) {}
+}
+
+function getActiveExportVoiceSlug() {
+  if (state.selectedExportSlug) return state.selectedExportSlug;
+  if (state.activePresetId) return state.activePresetId;
+  return "eleven-warm-host";
+}
+
+function renderExportedVoices() {
+  const list = $("exportedVoicesList");
+  if (!list) return;
+  list.innerHTML = "";
+
+  if (state.exportedVoices.length === 0) {
+    list.innerHTML = `<div class="section-desc" style="padding:10px 4px;">No exported voices yet. Name your current voice above and click <strong>Export &amp; Register Voice</strong> — it immediately goes live on <code>/v1/audio/speech</code> and generates a downloadable ZIP app bundle.</div>`;
+    return;
+  }
+
+  state.exportedVoices.forEach((v) => {
+    const row = document.createElement("div");
+    row.className = `exported-row ${v.slug === state.selectedExportSlug ? "active" : ""}`;
+    row.innerHTML = `
+      <div class="exported-info">
+        <div class="exported-title-line">
+          <strong>${escapeAttr(v.name)}</strong>
+          <span class="exported-slug">${escapeAttr(v.slug)}</span>
+          <span class="preset-tag">${v.engine === "chatterbox" ? "Chatterbox" : "Kokoro"}</span>
+        </div>
+      </div>
+      <div class="exported-actions">
+        <a class="btn btn-xs btn-accent-outline" href="/api/exported-voices/${encodeURIComponent(v.slug)}/bundle.zip" download title="Download self-contained ZIP with narrate.py, dsp.py, and voice files">ZIP Pack</a>
+        <a class="btn btn-xs btn-ghost" href="/api/exported-voices/${encodeURIComponent(v.slug)}/json" download title="Download portable .timbra.json">.timbra.json</a>
+        ${
+          v.has_style_npy
+            ? `<a class="btn btn-xs btn-ghost" href="/api/exported-voices/${encodeURIComponent(v.slug)}/style.npy" download title="Download baked (510, 1, 256) Kokoro style tensor">.npy</a>`
+            : ""
+        }
+        <button class="btn btn-xs btn-ghost exp-load-btn" title="Load this exported voice back into the Studio">Load</button>
+        <button class="slot-remove exp-del-btn" title="Delete exported voice">&times;</button>
+      </div>
+    `;
+
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("a") || e.target.closest("button")) return;
+      state.selectedExportSlug = v.slug;
+      renderExportedVoices();
+      renderExportSnippet();
+    });
+
+    row.querySelector(".exp-load-btn").addEventListener("click", (e) => {
+      e.stopPropagation();
+      loadExportedVoiceIntoStudio(v);
+    });
+
+    row.querySelector(".exp-del-btn").addEventListener("click", async (e) => {
+      e.stopPropagation();
+      await fetch(`/api/exported-voices/${encodeURIComponent(v.slug)}`, { method: "DELETE" });
+      state.exportedVoices = state.exportedVoices.filter((x) => x.slug !== v.slug);
+      if (state.selectedExportSlug === v.slug) {
+        state.selectedExportSlug = state.exportedVoices[0]?.slug || null;
+      }
+      renderExportedVoices();
+      renderExportSnippet();
+      showToast(`Removed "${v.name}"`);
+    });
+
+    list.appendChild(row);
+  });
+}
+
+function loadExportedVoiceIntoStudio(v) {
+  if (v.engine === "chatterbox") {
+    setEngine("chatterbox");
+    const c = v.config || {};
+    $("cbExagSlider").value = c.exaggeration ?? 0.55;
+    $("cbCfgSlider").value = c.cfg_weight ?? 0.50;
+    $("cbTempSlider").value = c.temperature ?? 0.80;
+    $("cbRepSlider").value = c.repetition_penalty ?? 1.20;
+    $("sentencePauseSlider").value = c.sentence_pause ?? 0.30;
+    $("paragraphPauseSlider").value = c.paragraph_pause ?? 0.60;
+    if (c.rhythm_humanize !== undefined) $("rhythmHumanizeSlider").value = c.rhythm_humanize;
+    if (c.mastering) applyConfig({ mastering: c.mastering }, false);
+    else syncSliderReadouts();
+  } else {
+    setEngine("kokoro");
+    applyConfig(v.config || {}, false);
+  }
+  if (Array.isArray(v.pronunciation_rules)) {
+    state.pronunciationRules = v.pronunciation_rules.map((r) => ({ find: r.find, replace: r.replace }));
+    renderRulesUI();
+  }
+  $("codeModal").classList.add("hidden");
+  showToast(`Loaded "${v.name}" into Studio`);
+  if (isLiveSyncEnabled()) scheduleLiveSynthesize(150, true);
+}
+
+function renderExportSnippet() {
+  const block = $("exportCodeBlock");
+  if (!block) return;
+  const voiceId = getActiveExportVoiceSlug();
+  const sampleText = ($("scriptInput").value.trim().split("\n")[0] || "Hello from my app!").slice(0, 120);
+  const tab = state.exportCodeTab || "curl";
+
+  if (tab === "curl") {
+    block.textContent = `# Works with Open WebUI, SillyTavern, Obsidian, Raycast, or any OpenAI-compatible app:
+# Base URL:  http://127.0.0.1:8765/v1
+# Voice ID:  ${voiceId}
+# Formats:   wav | mp3 | flac | ogg | pcm
+
+curl http://127.0.0.1:8765/v1/audio/speech \\
+  -H "Content-Type: application/json" \\
+  -d '${JSON.stringify({
+    model: "timbra",
+    voice: voiceId,
+    input: sampleText,
+    response_format: "mp3",
+    speed: 1.0,
+  })}' \\
+  --output narration.mp3
+
+# List all available voices programmatically:
+curl http://127.0.0.1:8765/v1/audio/voices`;
+    return;
+  }
+
+  if (tab === "js") {
+    block.textContent = `// Drop-in narration helper for any Web, Electron, or React app
+export async function narrate(text, voice = "${voiceId}", format = "wav") {
+  const res = await fetch("http://127.0.0.1:8765/v1/audio/speech", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "timbra",
+      voice,
+      input: text,
+      response_format: format,
+      speed: 1.0,
+    }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  const url = URL.createObjectURL(await res.blob());
+  const audio = new Audio(url);
+  audio.addEventListener("ended", () => URL.revokeObjectURL(url));
+  await audio.play();
+  return audio;
+}
+
+// Usage:
+narrate(${JSON.stringify(sampleText)});`;
+    return;
+  }
+
+  if (tab === "swift") {
+    block.textContent = `import Foundation
+import AVFoundation
+
+final class TimbraNarrator {
+    private var player: AVAudioPlayer?
+
+    func speak(_ text: String, voice: String = "${voiceId}") async throws {
+        var req = URLRequest(url: URL(string: "http://127.0.0.1:8765/v1/audio/speech")!)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "model": "timbra",
+            "voice": voice,
+            "input": text,
+            "response_format": "wav",
+            "speed": 1.0
+        ])
+        let (data, _) = try await URLSession.shared.data(for: req)
+        await MainActor.run {
+            self.player = try? AVAudioPlayer(data: data)
+            self.player?.play()
+        }
+    }
+}
+
+// Usage:
+// let narrator = TimbraNarrator()
+// try await narrator.speak(${JSON.stringify(sampleText)})`;
+    return;
+  }
+
+  if (tab === "python") {
+    block.textContent = `# Works with the official OpenAI Python SDK (no API key needed locally)
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8765/v1", api_key="timbra-local")
+
+with client.audio.speech.with_streaming_response.create(
+    model="timbra",
+    voice="${voiceId}",
+    input=${JSON.stringify(sampleText)},
+    response_format="mp3",
+) as response:
+    response.stream_to_file("narration.mp3")
+
+print("Saved narration.mp3")`;
+    return;
+  }
+
+  block.textContent = generatePythonCode();
+}
+
 function generatePythonCode() {
   const m = readMasteringConfig();
   if (state.engine === "chatterbox") {
@@ -1831,13 +2071,90 @@ function wireEvents() {
   });
 
   $("btnExportCode").addEventListener("click", () => {
-    $("exportCodeBlock").textContent = generatePythonCode();
+    const presetObj = state.presets.find((p) => p.id === state.activePresetId);
+    const defaultName =
+      state.engine === "chatterbox"
+        ? (state.references.find((r) => r.id === state.activeRefId)?.name || "Chatterbox Voice")
+        : (presetObj ? presetObj.name : "Custom Narrator");
+    if (!$("exportVoiceName").value.trim()) {
+      $("exportVoiceName").value = defaultName;
+    }
+    loadExportedVoices();
+    renderExportSnippet();
     $("codeModal").classList.remove("hidden");
+  });
+
+  $("btnRegisterExportVoice").addEventListener("click", async () => {
+    const name = $("exportVoiceName").value.trim();
+    if (!name) {
+      showToast("Enter a voice name first.");
+      return;
+    }
+    const btn = $("btnRegisterExportVoice");
+    btn.disabled = true;
+    btn.textContent = "Exporting…";
+    try {
+      const res = await fetch("/api/exported-voices", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          engine: state.engine,
+          config: readCurrentEngineConfigForExport(),
+          pronunciation_rules: state.pronunciationRules.filter((r) => r.find.trim()),
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || "Export failed");
+      }
+      const { voice } = await res.json();
+      state.selectedExportSlug = voice.slug;
+      await loadExportedVoices();
+      showToast(`Exported "${voice.slug}" — live at /v1/audio/speech!`);
+    } catch (err) {
+      showToast(`Export error: ${err.message}`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Export & Register Voice";
+    }
+  });
+
+  $("importTimbraInput").addEventListener("change", async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    try {
+      const res = await fetch("/api/exported-voices/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: file,
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || "Import failed");
+      }
+      const { voice } = await res.json();
+      state.selectedExportSlug = voice.slug;
+      await loadExportedVoices();
+      loadExportedVoiceIntoStudio(voice);
+    } catch (err) {
+      showToast(`Import error: ${err.message}`);
+    }
+  });
+
+  document.querySelectorAll("#exportCodeTabs .code-tab").forEach((tabBtn) => {
+    tabBtn.addEventListener("click", () => {
+      document.querySelectorAll("#exportCodeTabs .code-tab").forEach((b) => b.classList.remove("active"));
+      tabBtn.classList.add("active");
+      state.exportCodeTab = tabBtn.dataset.lang;
+      renderExportSnippet();
+    });
   });
 
   $("btnCopyCode").addEventListener("click", async () => {
     await navigator.clipboard.writeText($("exportCodeBlock").textContent);
-    showToast("Copied Python code to clipboard");
+    showToast("Copied snippet to clipboard");
   });
 }
 

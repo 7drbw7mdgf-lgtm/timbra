@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Kokoro Studio — Voice Tuning &amp; Mastering</title>
+  <title>Timbra — Local Voice Design, Cloning &amp; Narration Studio</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -22,8 +22,8 @@
             <span class="bar b4"></span>
           </div>
           <div>
-            <div class="brand-title">Voice Studio</div>
-            <div class="brand-sub">Kokoro 82M &amp; Chatterbox MLX Console</div>
+            <div class="brand-title">Timbra</div>
+            <div class="brand-sub">Kokoro 82M &amp; Chatterbox MLX Studio</div>
           </div>
         </div>
 
@@ -54,9 +54,9 @@
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
           Save Preset
         </button>
-        <button class="btn btn-ghost" id="btnExportCode" title="Export tuned settings as Python code">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-          Export Python
+        <button class="btn btn-primary" id="btnExportCode" title="Export voice pack (.zip / .npy / .timbra.json) and API code for your apps">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          Export Voice
         </button>
       </div>
     </header>
@@ -707,22 +707,58 @@ Listen closely to the phrasing, the subtle breath between thoughts, and the soft
     </div>
   </div>
 
-  <!-- Export Python Modal -->
+  <!-- Export Voice for Apps Modal -->
   <div class="modal-backdrop hidden" id="codeModal">
-    <div class="modal modal-lg">
+    <div class="modal modal-xl">
       <div class="modal-head">
-        <h3>Export Tuned Python Snippet</h3>
-        <button class="icon-close" data-close-modal="codeModal">&times;</button>
+        <div>
+          <h3>Export Voice for Apps</h3>
+          <div class="section-desc">Register your voice on Timbra's local OpenAI-compatible TTS API (<code>/v1/audio/speech</code>) or download a portable voice pack.</div>
+        </div>
+        <div class="ref-actions-row">
+          <label class="btn btn-xs btn-ghost" for="importTimbraInput" style="cursor:pointer;">Import .timbra.json</label>
+          <input type="file" id="importTimbraInput" accept=".json,.timbra.json" class="sr-only" />
+          <button class="icon-close" data-close-modal="codeModal">&times;</button>
+        </div>
       </div>
-      <div class="modal-body">
-        <p class="section-desc" style="margin-bottom: 10px;">
-          Drop this into any script using <code>kokoro-onnx</code> and <code>kokoro-studio/dsp.py</code> to reproduce your exact voice blend, phrasing, and studio mastering chain.
-        </p>
-        <pre class="code-block" id="exportCodeBlock"></pre>
+
+      <div class="modal-body export-modal-body">
+        <!-- Register & Export Current Voice -->
+        <div class="export-create-bar">
+          <div class="export-field-grow">
+            <label class="field-label" for="exportVoiceName" style="margin-top:0;">Voice Name (becomes your API voice ID)</label>
+            <input type="text" id="exportVoiceName" class="text-input" placeholder="e.g. Warm Radio Host" />
+          </div>
+          <button class="btn btn-primary" id="btnRegisterExportVoice">Export &amp; Register Voice</button>
+        </div>
+
+        <!-- Exported Voices Library -->
+        <div class="export-section">
+          <div class="export-section-head">
+            <span class="subhead" style="margin:0;">Exported App Voices</span>
+            <span class="api-endpoint-pill">POST http://127.0.0.1:8765/v1/audio/speech</span>
+          </div>
+          <div class="exported-list" id="exportedVoicesList"></div>
+        </div>
+
+        <!-- App Integration Code Tabs -->
+        <div class="export-section">
+          <div class="export-tabs-row">
+            <div class="code-tabs" id="exportCodeTabs">
+              <button class="code-tab active" data-lang="curl">OpenAI API / cURL</button>
+              <button class="code-tab" data-lang="js">JavaScript / Web</button>
+              <button class="code-tab" data-lang="swift">Swift (macOS)</button>
+              <button class="code-tab" data-lang="python">Python SDK</button>
+              <button class="code-tab" data-lang="standalone">Offline Python</button>
+            </div>
+            <button class="btn btn-xs btn-accent-outline" id="btnCopyCode">Copy Snippet</button>
+          </div>
+          <pre class="code-block" id="exportCodeBlock"></pre>
+        </div>
       </div>
+
       <div class="modal-foot">
-        <button class="btn btn-ghost" data-close-modal="codeModal">Close</button>
-        <button class="btn btn-primary" id="btnCopyCode">Copy Code</button>
+        <button class="btn btn-ghost" data-close-modal="codeModal">Done</button>
       </div>
     </div>
   </div>

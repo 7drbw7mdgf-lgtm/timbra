@@ -13,6 +13,7 @@ models/
 # Generated audio & user reference clips
 outputs/
 references/
+exported_voices/
 presets.json
 *.wav
 *.mp3
