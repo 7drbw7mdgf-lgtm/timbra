@@ -17,8 +17,7 @@ from typing import Any
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from kokoro_onnx import Kokoro
 from pydantic import BaseModel, Field
@@ -45,12 +44,24 @@ MAX_CACHED_TAKES = 25
 CHATTERBOX_MODEL_ID = "mlx-community/chatterbox-8bit"
 
 app = FastAPI(title="Kokoro & Chatterbox Studio", version="2.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+# The UI is served from this same server, so no cross-origin access is needed.
+# Only accept requests addressed to a loopback host (blocks DNS rebinding) and,
+# when the browser sends an Origin header, only from that same origin (blocks
+# other websites from driving the API while the studio is running).
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+
+
+@app.middleware("http")
+async def same_origin_only(request: Request, call_next):
+    host = request.headers.get("host", "")
+    hostname = host.rsplit(":", 1)[0] if not host.endswith("]") else host
+    if hostname not in LOOPBACK_HOSTS:
+        return JSONResponse({"detail": "Forbidden host."}, status_code=403)
+    origin = request.headers.get("origin")
+    if origin is not None and origin != f"{request.url.scheme}://{host}":
+        return JSONResponse({"detail": "Cross-origin requests are not allowed."}, status_code=403)
+    return await call_next(request)
 
 # Global engine state
 kokoro: Kokoro | None = None

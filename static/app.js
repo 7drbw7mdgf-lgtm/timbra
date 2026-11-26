@@ -692,7 +692,12 @@ function renderRulesUI() {
 }
 
 function escapeAttr(str) {
-  return String(str || "").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 // ---------- Presets UI ----------
@@ -734,7 +739,7 @@ function renderPresets() {
       const btn = document.createElement("div");
       btn.className = `preset-pill ${p.id === state.activeCbPresetId ? "active" : ""}`;
       btn.title = p.description || p.name;
-      btn.innerHTML = `<span>${p.name}</span><span class="preset-tag">${p.tag}</span>`;
+      btn.innerHTML = `<span>${escapeAttr(p.name)}</span><span class="preset-tag">${escapeAttr(p.tag)}</span>`;
       btn.addEventListener("click", () => {
         state.activeCbPresetId = p.id;
         applyChatterboxPreset(p);
@@ -755,8 +760,8 @@ function renderPresets() {
     btn.className = `preset-pill ${p.id === state.activePresetId ? "active" : ""}`;
     btn.title = p.description || p.name;
     btn.innerHTML = `
-      <span>${p.name}</span>
-      <span class="preset-tag">${p.tag || "Preset"}</span>
+      <span>${escapeAttr(p.name)}</span>
+      <span class="preset-tag">${escapeAttr(p.tag || "Preset")}</span>
       ${!p.builtin ? `<button class="preset-del" title="Delete preset">&times;</button>` : ""}
     `;
     btn.addEventListener("click", (e) => {
