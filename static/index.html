@@ -1,0 +1,793 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kokoro Studio — Voice Tuning &amp; Mastering</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Studio Bar -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <span class="bar b1"></span>
+            <span class="bar b2"></span>
+            <span class="bar b3"></span>
+            <span class="bar b4"></span>
+          </div>
+          <div>
+            <div class="brand-title">Voice Studio</div>
+            <div class="brand-sub">Kokoro 82M &amp; Chatterbox MLX Console</div>
+          </div>
+        </div>
+
+        <!-- Engine Switcher -->
+        <div class="engine-switcher" role="group" aria-label="TTS Engine">
+          <button class="engine-btn active" id="btnEngineKokoro" data-engine="kokoro">
+            <span class="engine-name">Kokoro 82M</span>
+            <span class="engine-tag">Fast · Blend</span>
+          </button>
+          <button class="engine-btn" id="btnEngineChatterbox" data-engine="chatterbox">
+            <span class="engine-name">Chatterbox MLX</span>
+            <span class="engine-tag">Zero-Shot Clone</span>
+          </button>
+        </div>
+
+        <div class="status-pill" id="engineStatus">
+          <span class="status-dot"></span>
+          <span id="engineStatusText">Connecting…</span>
+        </div>
+      </div>
+
+      <div class="topbar-right">
+        <button class="btn btn-accent-outline" id="btnMatchRef" title="Upload a voice clip to auto-tune Kokoro toward its pitch, warmth, and cadence">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+          Match Reference Clip
+        </button>
+        <button class="btn btn-ghost" id="btnSavePreset" title="Save current settings as a preset">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+          Save Preset
+        </button>
+        <button class="btn btn-ghost" id="btnExportCode" title="Export tuned settings as Python code">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+          Export Python
+        </button>
+      </div>
+    </header>
+
+    <!-- Presets Ribbon -->
+    <section class="presets-ribbon">
+      <div class="ribbon-label">Presets</div>
+      <div class="presets-list" id="presetsList"></div>
+    </section>
+
+    <!-- Main 2-Column Studio Workspace -->
+    <main class="workspace">
+      <!-- LEFT COLUMN: Script & Playback Deck -->
+      <section class="stage-col">
+        <!-- Script Composer -->
+        <div class="card script-card">
+          <div class="card-header">
+            <div class="card-title-group">
+              <h2 class="card-title">Script</h2>
+              <div class="sample-chips" id="sampleChips">
+                <button class="chip" data-sample="podcast">Podcast</button>
+                <button class="chip" data-sample="conversational">Conversational</button>
+                <button class="chip" data-sample="story">Storytelling</button>
+                <button class="chip" data-sample="explainer">Explainer</button>
+              </div>
+            </div>
+            <div class="lang-select-wrap">
+              <label for="langSelect" class="sr-only">Language</label>
+              <select id="langSelect" class="select-sm">
+                <option value="en-us">English (US)</option>
+                <option value="en-gb">English (UK)</option>
+                <option value="es">Spanish</option>
+                <option value="fr-fr">French</option>
+                <option value="it">Italian</option>
+                <option value="pt-br">Portuguese (BR)</option>
+                <option value="hi">Hindi</option>
+                <option value="ja">Japanese</option>
+                <option value="cmn">Mandarin</option>
+              </select>
+            </div>
+          </div>
+
+          <textarea
+            id="scriptInput"
+            class="script-textarea"
+            rows="6"
+            placeholder="Type or paste what you want Kokoro to say…"
+          >Hey, welcome back. Today we're testing how close a tiny local model can get to a real studio voice — warm, unhurried, and genuinely conversational.
+
+Listen closely to the phrasing, the subtle breath between thoughts, and the softness on the high frequencies. When you dial in the blend and mastering chain just right, the difference is night and day.</textarea>
+
+          <div class="script-footer">
+            <div class="script-meta">
+              <span id="charCount">0 chars</span>
+              <span class="dot-sep">·</span>
+              <label class="inline-check">
+                <input type="checkbox" id="includeRawCheck" checked />
+                <span>Generate Raw A/B baseline</span>
+              </label>
+            </div>
+            <div class="script-actions">
+              <button class="btn btn-subtle" id="btnTogglePhonemes">IPA Phonemes</button>
+              <button class="btn btn-primary" id="btnSynthesize">
+                <span class="btn-spinner hidden" id="synthSpinner"></span>
+                <svg id="synthIcon" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                <span id="synthLabel">Synthesize</span>
+                <kbd class="kbd">⌘↵</kbd>
+              </button>
+            </div>
+          </div>
+
+          <!-- Collapsible Phoneme Inspector -->
+          <div class="phoneme-drawer hidden" id="phonemeDrawer">
+            <div class="phoneme-header">
+              <label class="inline-check">
+                <input type="checkbox" id="useCustomPhonemesCheck" />
+                <span>Speak directly from IPA below (override text G2P)</span>
+              </label>
+              <button class="btn btn-xs btn-ghost" id="btnRefreshPhonemes">Refresh IPA</button>
+            </div>
+            <textarea
+              id="phonemeInput"
+              class="phoneme-textarea"
+              rows="3"
+              placeholder="Click 'Refresh IPA' or synthesize to inspect exact phonemes…"
+            ></textarea>
+          </div>
+        </div>
+
+        <!-- Waveform & A/B Deck -->
+        <div class="card deck-card">
+          <div class="deck-top">
+            <div class="deck-transport">
+              <button class="play-btn" id="btnPlayPause" disabled title="Play / Pause (Space)">
+                <svg id="iconPlay" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 4 20 12 6 20 6 4"/></svg>
+                <svg id="iconPause" class="hidden" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+              </button>
+              <div class="time-display">
+                <span id="timeCurrent">0:00.0</span>
+                <span class="time-sep">/</span>
+                <span id="timeTotal">0:00.0</span>
+              </div>
+            </div>
+
+            <!-- Instant A / B Comparison Switch -->
+            <div class="ab-switcher" role="group" aria-label="A/B Comparison">
+              <button class="ab-btn" id="btnModeRaw" data-mode="raw" disabled>
+                <span class="ab-tag">A</span>
+                <span id="abRawLabel">Raw Kokoro</span>
+              </button>
+              <button class="ab-btn active" id="btnModeTuned" data-mode="tuned" disabled>
+                <span class="ab-tag">B</span>
+                <span id="abTunedLabel">Tuned + Mastered</span>
+              </button>
+            </div>
+
+            <div class="deck-downloads">
+              <label class="live-toggle-pill" title="Automatically re-synthesize &amp; update waveform whenever you change any control on the right">
+                <input type="checkbox" id="liveSyncCheck" checked />
+                <span class="live-indicator" id="liveSyncDot"></span>
+                <span id="liveSyncLabel">Live Sync</span>
+              </label>
+              <button class="btn btn-xs btn-ghost" id="btnDownload" disabled title="Download active WAV">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                WAV
+              </button>
+            </div>
+          </div>
+
+          <!-- Instant Live Tuning Summary Strip -->
+          <div class="live-summary-bar" id="liveSummaryBar">
+            <span class="live-summary-text" id="liveSummaryText">Loading profile…</span>
+            <span class="live-sync-state" id="liveSyncState">Ready</span>
+          </div>
+
+          <div class="waveform-wrap" id="waveformWrap">
+            <canvas id="waveformCanvas"></canvas>
+            <div class="waveform-empty" id="waveformEmpty">
+              <span>Hit <strong>Synthesize</strong> to hear your tuned voice and A/B compare against raw Kokoro.</span>
+            </div>
+          </div>
+
+          <div class="deck-telemetry">
+            <div class="telemetry-item">
+              <span class="t-label">Mode</span>
+              <span class="t-val" id="telMode">—</span>
+            </div>
+            <div class="telemetry-item">
+              <span class="t-label">Inference</span>
+              <span class="t-val" id="telInfer">—</span>
+            </div>
+            <div class="telemetry-item">
+              <span class="t-label">Mastering DSP</span>
+              <span class="t-val" id="telDsp">—</span>
+            </div>
+            <div class="telemetry-item">
+              <span class="t-label">Speed (RTF)</span>
+              <span class="t-val" id="telRtf">—</span>
+            </div>
+          </div>
+
+          <!-- Take History -->
+          <div class="history-strip hidden" id="historyStrip">
+            <span class="history-label">Takes</span>
+            <div class="history-pills" id="historyPills"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- RIGHT COLUMN: Tuning Console -->
+      <section class="console-col">
+        <div class="card console-card">
+          <nav class="console-tabs" role="tablist">
+            <button class="tab-btn active" data-tab="blend" role="tab">
+              <span class="tab-num">01</span> <span id="tab01Label">Voice Blend</span>
+            </button>
+            <button class="tab-btn" data-tab="pacing" role="tab">
+              <span class="tab-num">02</span> Pacing
+            </button>
+            <button class="tab-btn" data-tab="mastering" role="tab">
+              <span class="tab-num">03</span> Mastering
+              <span class="live-dot" id="masterLiveDot" title="Live re-master active"></span>
+            </button>
+            <button class="tab-btn" data-tab="humanize" role="tab">
+              <span class="tab-num">04</span> Humanize
+              <span class="live-dot" id="humanizeLiveDot" title="Live humanizer active"></span>
+            </button>
+          </nav>
+
+          <!-- TAB 1: VOICE BLEND (Kokoro) OR VOICE CLONE & EMOTION (Chatterbox) -->
+          <div class="tab-panel active" id="panel-blend">
+            <div id="kokoroTab01">
+            <div class="panel-section">
+              <div class="section-head">
+                <div>
+                  <h3>Voice Style Mixer</h3>
+                  <p class="section-desc">Blend up to 4 Kokoro style vectors to sculpt a custom vocal identity.</p>
+                </div>
+                <button class="btn btn-xs btn-accent-outline" id="btnAddVoice">+ Add Voice</button>
+              </div>
+
+              <!-- Stacked visual blend ratio bar -->
+              <div class="blend-bar" id="blendBar"></div>
+
+              <!-- Dynamic voice slots -->
+              <div class="blend-slots" id="blendSlots"></div>
+            </div>
+
+            <div class="panel-section">
+              <div class="section-head">
+                <div>
+                  <h3>Split Timbre &amp; Prosody</h3>
+                  <p class="section-desc">Keep your blend's vocal tone, but borrow rhythm &amp; intonation from another voice.</p>
+                </div>
+                <label class="switch">
+                  <input type="checkbox" id="splitModeCheck" />
+                  <span class="switch-slider"></span>
+                </label>
+              </div>
+
+              <div class="split-picker hidden" id="splitPickerWrap">
+                <label class="field-label" for="prosodyVoiceSelect">Prosody Donor Voice</label>
+                <select id="prosodyVoiceSelect" class="select-full"></select>
+              </div>
+            </div>
+
+            <div class="panel-section">
+              <div class="section-head">
+                <div>
+                  <h3>Style Vector Shaping</h3>
+                  <p class="section-desc">Fine-tune expressiveness and phrasing length directly in Kokoro's embedding space.</p>
+                </div>
+              </div>
+
+              <div class="control-row">
+                <div class="control-meta">
+                  <label for="prosodyIntensity">Prosody Expressiveness</label>
+                  <span class="val-badge" id="valProsodyIntensity">1.12×</span>
+                </div>
+                <input type="range" id="prosodyIntensity" min="0.55" max="1.45" step="0.02" value="1.12" />
+                <div class="range-hints"><span>Calm &amp; Even</span><span>Natural (1.0×)</span><span>Expressive</span></div>
+              </div>
+
+              <div class="control-row">
+                <div class="control-meta">
+                  <label for="styleOffset">Phrasing Cadence Bias</label>
+                  <span class="val-badge" id="valStyleOffset">+12</span>
+                </div>
+                <input type="range" id="styleOffset" min="-30" max="60" step="2" value="12" />
+                <div class="range-hints"><span>Punchy / Short</span><span>Neutral (0)</span><span>Relaxed / Long-Form</span></div>
+              </div>
+            </div>
+            </div><!-- /kokoroTab01 -->
+
+            <!-- Chatterbox MLX Zero-Shot Voice Cloning & Emotion Panel -->
+            <div id="chatterboxTab01" class="hidden">
+              <div class="panel-section">
+                <div class="section-head">
+                  <div>
+                    <h3>Reference Voice (Zero-Shot Cloning)</h3>
+                    <p class="section-desc">Upload any 5–15s clean speech clip to clone timbre, accent, and delivery style locally on Apple Silicon.</p>
+                  </div>
+                  <div class="ref-actions-row">
+                    <button class="btn btn-xs btn-ghost" id="btnUseCurrentTakeRef" title="Save your current take as a Chatterbox reference voice">From Take</button>
+                    <label class="btn btn-xs btn-accent-outline" for="cbRefUploadInput" style="cursor:pointer;">+ Upload Clip</label>
+                    <input type="file" id="cbRefUploadInput" accept=".wav,.mp3,.flac,.ogg,.m4a,audio/*" class="sr-only" />
+                  </div>
+                </div>
+
+                <div class="ref-drop-mini" id="cbRefDropzone">
+                  <span>Drop a WAV / MP3 / M4A / FLAC voice sample here, or select a saved reference below</span>
+                </div>
+
+                <div class="ref-list" id="cbRefList"></div>
+              </div>
+
+              <div class="panel-section">
+                <div class="section-head">
+                  <div>
+                    <h3>Emotion &amp; Expressiveness</h3>
+                    <p class="section-desc">Dial in acting intensity, accent/clone adherence, and natural vocal spontaneity.</p>
+                  </div>
+                </div>
+
+                <div class="control-row">
+                  <div class="control-meta">
+                    <label for="cbExagSlider">Emotion Exaggeration</label>
+                    <span class="val-badge" id="valCbExag">0.55</span>
+                  </div>
+                  <input type="range" id="cbExagSlider" min="0.00" max="1.40" step="0.05" value="0.55" />
+                  <div class="range-hints"><span>0.0 Calm / Flat</span><span class="hint-accent">0.50 Natural</span><span>1.4 Dramatic</span></div>
+                </div>
+
+                <div class="control-row">
+                  <div class="control-meta">
+                    <label for="cbCfgSlider">Clone Adherence &amp; Pacing (CFG)</label>
+                    <span class="val-badge" id="valCbCfg">0.50</span>
+                  </div>
+                  <input type="range" id="cbCfgSlider" min="0.00" max="1.00" step="0.05" value="0.50" />
+                  <div class="range-hints"><span>0.25 Slower / Expressive</span><span>0.50 Balanced</span><span>0.85 Strict / Brisk</span></div>
+                </div>
+
+                <div class="control-grid-2">
+                  <div class="control-row">
+                    <div class="control-meta">
+                      <label for="cbTempSlider">Spontaneity (Temp)</label>
+                      <span class="val-badge" id="valCbTemp">0.80</span>
+                    </div>
+                    <input type="range" id="cbTempSlider" min="0.20" max="1.30" step="0.05" value="0.80" />
+                  </div>
+
+                  <div class="control-row">
+                    <div class="control-meta">
+                      <label for="cbRepSlider">Repetition Penalty</label>
+                      <span class="val-badge" id="valCbRep">1.20</span>
+                    </div>
+                    <input type="range" id="cbRepSlider" min="1.00" max="1.65" step="0.05" value="1.20" />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- TAB 2: DELIVERY & PACING -->
+          <div class="tab-panel" id="panel-pacing">
+            <div class="panel-section">
+              <div class="section-head">
+                <div>
+                  <h3>Cadence &amp; Breath Pauses</h3>
+                  <p class="section-desc">Slowing slightly below 1.0× and giving sentences breathing room removes the "AI rush."</p>
+                </div>
+              </div>
+
+              <div class="control-row kokoro-only">
+                <div class="control-meta">
+                  <label for="speedSlider">Speaking Speed</label>
+                  <span class="val-badge" id="valSpeed">0.92×</span>
+                </div>
+                <input type="range" id="speedSlider" min="0.65" max="1.40" step="0.01" value="0.92" />
+                <div class="range-hints"><span>0.65× Slow</span><span class="hint-accent">0.88–0.96× Sweet Spot</span><span>1.40× Fast</span></div>
+              </div>
+
+              <div class="control-grid-2">
+                <div class="control-row">
+                  <div class="control-meta">
+                    <label for="sentencePauseSlider">Sentence Pause</label>
+                    <span class="val-badge" id="valSentencePause">0.36s</span>
+                  </div>
+                  <input type="range" id="sentencePauseSlider" min="0.00" max="1.00" step="0.02" value="0.36" />
+                </div>
+
+                <div class="control-row kokoro-only">
+                  <div class="control-meta">
+                    <label for="clausePauseSlider">Clause / Comma Pause</label>
+                    <span class="val-badge" id="valClausePause">0.14s</span>
+                  </div>
+                  <input type="range" id="clausePauseSlider" min="0.00" max="0.50" step="0.01" value="0.14" />
+                </div>
+              </div>
+
+              <div class="control-row">
+                <div class="control-meta">
+                  <label for="paragraphPauseSlider">Paragraph Break</label>
+                  <span class="val-badge" id="valParagraphPause">0.68s</span>
+                </div>
+                <input type="range" id="paragraphPauseSlider" min="0.10" max="1.50" step="0.02" value="0.68" />
+              </div>
+            </div>
+
+            <div class="panel-section">
+              <div class="toggle-list">
+                <div class="toggle-row">
+                  <div>
+                    <div class="toggle-title">Sentence-Aware Breath Chunking</div>
+                    <div class="toggle-desc">Splits at sentence boundaries with smooth crossfades so pause timing is exact and never rushed.</div>
+                  </div>
+                  <label class="switch">
+                    <input type="checkbox" id="continuousCheck" checked />
+                    <span class="switch-slider"></span>
+                  </label>
+                </div>
+
+                <div class="toggle-row">
+                  <div>
+                    <div class="toggle-title">Smart Punctuation Breathing</div>
+                    <div class="toggle-desc">Turns em-dashes and semicolons into subtle conversational pauses.</div>
+                  </div>
+                  <label class="switch">
+                    <input type="checkbox" id="smartPuncCheck" checked />
+                    <span class="switch-slider"></span>
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <div class="panel-section">
+              <div class="section-head">
+                <div>
+                  <h3>Pronunciation Dictionary</h3>
+                  <p class="section-desc">Fix tricky names, acronyms, or brands before synthesis.</p>
+                </div>
+                <button class="btn btn-xs btn-ghost" id="btnAddRule">+ Add Rule</button>
+              </div>
+              <div class="rules-list" id="rulesList"></div>
+            </div>
+          </div>
+
+          <!-- TAB 3: STUDIO MASTERING -->
+          <div class="tab-panel" id="panel-mastering">
+            <div class="master-banner">
+              <div class="master-banner-left">
+                <label class="switch">
+                  <input type="checkbox" id="masterEnabledCheck" checked />
+                  <span class="switch-slider"></span>
+                </label>
+                <div>
+                  <div class="toggle-title">Studio Mastering Chain</div>
+                  <div class="toggle-desc">Instant ~20ms re-mastering on your current take — no re-synthesis needed.</div>
+                </div>
+              </div>
+              <button class="btn btn-xs btn-ghost" id="btnResetMastering">Flat Reset</button>
+            </div>
+
+            <div class="master-controls" id="masterControlsWrap">
+              <div class="panel-section">
+                <h3 class="subhead">3-Band Vocal EQ</h3>
+                <div class="control-grid-3">
+                  <div class="control-row">
+                    <div class="control-meta">
+                      <label for="warmthSlider">Warmth <span class="freq-tag">210Hz</span></label>
+                      <span class="val-badge" id="valWarmth">+2.4 dB</span>
+                    </div>
+                    <input type="range" id="warmthSlider" min="-6" max="6" step="0.2" value="2.4" />
+                  </div>
+
+                  <div class="control-row">
+                    <div class="control-meta">
+                      <label for="presenceSlider">Presence <span class="freq-tag">3.1kHz</span></label>
+                      <span class="val-badge" id="valPresence">+1.4 dB</span>
+                    </div>
+                    <input type="range" id="presenceSlider" min="-6" max="6" step="0.2" value="1.4" />
+                  </div>
+
+                  <div class="control-row">
+                    <div class="control-meta">
+                      <label for="airSlider">Air / Silk <span class="freq-tag">8.5kHz</span></label>
+                      <span class="val-badge" id="valAir">+1.8 dB</span>
+                    </div>
+                    <input type="range" id="airSlider" min="-6" max="6" step="0.2" value="1.8" />
+                  </div>
+                </div>
+              </div>
+
+              <div class="panel-section">
+                <h3 class="subhead">Character, Dynamics &amp; Space</h3>
+                <div class="control-grid-2">
+                  <div class="control-row">
+                    <div class="control-meta">
+                      <label for="tubeWarmthSlider">Tube Warmth (Husky Preamp)</label>
+                      <span class="val-badge" id="valTubeWarmth">16%</span>
+                    </div>
+                    <input type="range" id="tubeWarmthSlider" min="0" max="1" step="0.02" value="0.16" />
+                  </div>
+
+                  <div class="control-row">
+                    <div class="control-meta">
+                      <label for="formantSlider">Vocal Depth (Formant)</label>
+                      <span class="val-badge" id="valFormant">0.0%</span>
+                    </div>
+                    <input type="range" id="formantSlider" min="-10" max="10" step="0.5" value="0.0" />
+                  </div>
+                </div>
+
+                <div class="control-row">
+                  <div class="control-meta">
+                    <label for="deesserSlider">De-Esser (Smooth Sibilance)</label>
+                    <span class="val-badge" id="valDeesser">42%</span>
+                  </div>
+                  <input type="range" id="deesserSlider" min="0" max="1" step="0.02" value="0.42" />
+                </div>
+
+                <div class="control-row">
+                  <div class="control-meta">
+                    <label for="compressionSlider">Vocal Compression</label>
+                    <span class="val-badge" id="valCompression">38%</span>
+                  </div>
+                  <input type="range" id="compressionSlider" min="0" max="1" step="0.02" value="0.38" />
+                </div>
+
+                <div class="control-row">
+                  <div class="control-meta">
+                    <label for="roomSlider">Studio Booth Ambience</label>
+                    <span class="val-badge" id="valRoom">14%</span>
+                  </div>
+                  <input type="range" id="roomSlider" min="0" max="0.50" step="0.01" value="0.14" />
+                </div>
+              </div>
+
+              <div class="panel-section">
+                <h3 class="subhead">Tone &amp; Loudness</h3>
+                <div class="control-grid-3">
+                  <div class="control-row">
+                    <div class="control-meta">
+                      <label for="pitchSlider">Pitch Shift</label>
+                      <span class="val-badge" id="valPitch">0.0 st</span>
+                    </div>
+                    <input type="range" id="pitchSlider" min="-2.0" max="2.0" step="0.05" value="0.0" />
+                  </div>
+
+                  <div class="control-row">
+                    <div class="control-meta">
+                      <label for="highpassSlider">High-Pass</label>
+                      <span class="val-badge" id="valHighpass">80 Hz</span>
+                    </div>
+                    <input type="range" id="highpassSlider" min="20" max="160" step="5" value="80" />
+                  </div>
+
+                  <div class="control-row">
+                    <div class="control-meta">
+                      <label for="lufsSlider">Loudness</label>
+                      <span class="val-badge" id="valLufs">-15.5 LUFS</span>
+                    </div>
+                    <input type="range" id="lufsSlider" min="-22" max="-12" step="0.5" value="-15.5" />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- TAB 4: HUMANIZE (Real Vocal Physics & Micro-Imperfections) -->
+          <div class="tab-panel" id="panel-humanize">
+            <div class="master-banner">
+              <div class="master-banner-left">
+                <label class="switch">
+                  <input type="checkbox" id="humanizeEnabledCheck" checked />
+                  <span class="switch-slider"></span>
+                </label>
+                <div>
+                  <div class="toggle-title">Vocal Humanizer Engine</div>
+                  <div class="toggle-desc">Adds organic breath, smile resonance, micro-imperfections, and open-mic realism live.</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="humanize-presets" id="humanizePresets">
+              <button class="chip" data-hpreset="off">Off (Sterile)</button>
+              <button class="chip active-chip" data-hpreset="natural">Subtle Natural</button>
+              <button class="chip" data-hpreset="radio">Warm Radio Host</button>
+              <button class="chip" data-hpreset="intimate">Intimate Podcast</button>
+            </div>
+
+            <div class="master-controls" id="humanizeControlsWrap">
+              <div class="panel-section">
+                <h3 class="subhead">Breath &amp; Expression Physics <span class="freq-tag">Instant Live</span></h3>
+                <div class="control-row">
+                  <div class="control-meta">
+                    <label for="breathSlider">Natural Breaths (Phrase Inhales)</label>
+                    <span class="val-badge" id="valBreath">25%</span>
+                  </div>
+                  <input type="range" id="breathSlider" min="0" max="1" step="0.02" value="0.25" />
+                  <div class="range-hints"><span>None</span><span>Subtle (25%)</span><span>Audible Inhales</span></div>
+                </div>
+
+                <div class="control-row">
+                  <div class="control-meta">
+                    <label for="airinessSlider">Close-Mic Airiness (Breathiness)</label>
+                    <span class="val-badge" id="valAiriness">15%</span>
+                  </div>
+                  <input type="range" id="airinessSlider" min="0" max="1" step="0.02" value="0.15" />
+                </div>
+
+                <div class="control-row">
+                  <div class="control-meta">
+                    <label for="smileSlider">Vocal Smile (Resonance)</label>
+                    <span class="val-badge" id="valSmile">+15%</span>
+                  </div>
+                  <input type="range" id="smileSlider" min="-1" max="1" step="0.05" value="0.15" />
+                  <div class="range-hints"><span>Serious / Chest</span><span>Neutral (0%)</span><span>Warm Radio Smile</span></div>
+                </div>
+              </div>
+
+              <div class="panel-section">
+                <h3 class="subhead">Micro-Imperfections &amp; Live Mic <span class="freq-tag">Instant Live</span></h3>
+                <div class="control-grid-2">
+                  <div class="control-row">
+                    <div class="control-meta">
+                      <label for="jitterSlider">Organic Shimmer &amp; Drift</label>
+                      <span class="val-badge" id="valJitter">20%</span>
+                    </div>
+                    <input type="range" id="jitterSlider" min="0" max="1" step="0.02" value="0.20" />
+                  </div>
+
+                  <div class="control-row">
+                    <div class="control-meta">
+                      <label for="vocalFrySlider">Phrase-End Vocal Fry</label>
+                      <span class="val-badge" id="valVocalFry">12%</span>
+                    </div>
+                    <input type="range" id="vocalFrySlider" min="0" max="1" step="0.02" value="0.12" />
+                  </div>
+                </div>
+
+                <div class="control-row">
+                  <div class="control-meta">
+                    <label for="roomFloorSlider">Live-Mic Room Tone (No Dead Silence)</label>
+                    <span class="val-badge" id="valRoomFloor">20%</span>
+                  </div>
+                  <input type="range" id="roomFloorSlider" min="0" max="1" step="0.02" value="0.20" />
+                </div>
+              </div>
+
+              <div class="panel-section">
+                <h3 class="subhead">Human Timing <span class="freq-tag">Auto Re-Synth</span></h3>
+                <div class="control-row">
+                  <div class="control-meta">
+                    <label for="rhythmHumanizeSlider">Uneven &ldquo;Thinking&rdquo; Rhythm</label>
+                    <span class="val-badge" id="valRhythmHumanize">30%</span>
+                  </div>
+                  <input type="range" id="rhythmHumanizeSlider" min="0" max="1" step="0.05" value="0.30" />
+                  <div class="range-hints"><span>Metronomic</span><span>Natural (30%)</span><span>Spontaneous Pacing</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Save Preset Modal -->
+  <div class="modal-backdrop hidden" id="presetModal">
+    <div class="modal">
+      <div class="modal-head">
+        <h3>Save Custom Preset</h3>
+        <button class="icon-close" data-close-modal="presetModal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <label class="field-label" for="presetNameInput">Preset Name</label>
+        <input type="text" id="presetNameInput" class="text-input" placeholder="e.g. Late Night Host v2" />
+        <label class="field-label" for="presetTagInput">Tag</label>
+        <input type="text" id="presetTagInput" class="text-input" placeholder="e.g. Warm, Male, Custom" value="Custom" />
+        <label class="field-label" for="presetDescInput">Notes (optional)</label>
+        <input type="text" id="presetDescInput" class="text-input" placeholder="Short description of this voice vibe" />
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" data-close-modal="presetModal">Cancel</button>
+        <button class="btn btn-primary" id="btnConfirmSavePreset">Save Preset</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Export Python Modal -->
+  <div class="modal-backdrop hidden" id="codeModal">
+    <div class="modal modal-lg">
+      <div class="modal-head">
+        <h3>Export Tuned Python Snippet</h3>
+        <button class="icon-close" data-close-modal="codeModal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="section-desc" style="margin-bottom: 10px;">
+          Drop this into any script using <code>kokoro-onnx</code> and <code>kokoro-studio/dsp.py</code> to reproduce your exact voice blend, phrasing, and studio mastering chain.
+        </p>
+        <pre class="code-block" id="exportCodeBlock"></pre>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" data-close-modal="codeModal">Close</button>
+        <button class="btn btn-primary" id="btnCopyCode">Copy Code</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Match Reference Audio Modal -->
+  <div class="modal-backdrop hidden" id="matchModal">
+    <div class="modal modal-lg">
+      <div class="modal-head">
+        <h3>Match Reference Voice Style</h3>
+        <button class="icon-close" data-close-modal="matchModal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="section-desc" style="margin-bottom: 12px;">
+          Upload a 5–30 second clean speech clip (WAV, MP3, FLAC, OGG, or M4A). Kokoro Studio measures its pitch, warmth, spectral balance, dynamics, and pacing, then auto-tunes your voice blend &amp; mastering chain to match that acoustic style.
+        </p>
+
+        <div class="control-grid-2" style="margin-bottom: 12px;">
+          <div>
+            <label class="field-label" for="matchAccentSelect">Target Accent</label>
+            <select id="matchAccentSelect" class="select-full">
+              <option value="en-gb">British English (UK)</option>
+              <option value="en-us">American English (US)</option>
+              <option value="auto">Auto (Best Match)</option>
+            </select>
+          </div>
+          <div>
+            <label class="field-label" for="matchGenderSelect">Voice Gender</label>
+            <select id="matchGenderSelect" class="select-full">
+              <option value="auto">Auto-detect from Pitch</option>
+              <option value="Female">Female</option>
+              <option value="Male">Male</option>
+            </select>
+          </div>
+        </div>
+
+        <label class="dropzone" id="matchDropzone" for="matchFileInput">
+          <input type="file" id="matchFileInput" accept=".wav,.mp3,.flac,.ogg,.m4a,audio/*" class="sr-only" />
+          <div class="dropzone-title" id="matchFileLabel">Click to choose an audio clip or drag &amp; drop here</div>
+          <div class="dropzone-sub">WAV · MP3 · FLAC · OGG · M4A (under 25 MB)</div>
+        </label>
+
+        <div class="match-result hidden" id="matchResultBox">
+          <div class="match-grid" id="matchMetricsGrid"></div>
+          <div class="match-blend-summary" id="matchBlendSummary"></div>
+        </div>
+
+        <div class="match-note">
+          Note: Kokoro-82M uses 54 fixed voices (no zero-shot voice cloning), so this matches acoustic style, pitch, warmth, and cadence — not a specific person's voice identity or regional dialect.
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" data-close-modal="matchModal">Close</button>
+        <button class="btn btn-primary" id="btnRunMatch" disabled>Analyze &amp; Auto-Tune</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast hidden" id="toast"></div>
+
+  <!-- Hidden audio elements for instant A/B switching & reference preview -->
+  <audio id="audioTuned" preload="auto"></audio>
+  <audio id="audioRaw" preload="auto"></audio>
+  <audio id="audioRefPreview" preload="none"></audio>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

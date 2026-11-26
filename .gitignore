@@ -1,0 +1,24 @@
+# Python & virtual environment
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Model weights & caches (downloaded via ./setup.sh)
+models/
+
+# Generated audio & user reference clips
+outputs/
+references/
+presets.json
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.onnx
+*.safetensors
+*.bin
