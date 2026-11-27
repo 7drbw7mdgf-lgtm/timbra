@@ -1703,3 +1703,84 @@ input[type="range"]:focus-visible {
     padding-right: 6px;
   }
 }
+
+/* ---------- Layout refinements ---------- */
+
+/* Presets live at the top of the right-hand console */
+.workspace {
+  margin-top: 18px;
+}
+.console-col {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.console-col > .presets-ribbon {
+  padding: 0 0 12px;
+  margin-bottom: 12px;
+}
+
+/* Keep the script and player in view while the console scrolls */
+@media (min-width: 1041px) {
+  .stage-col {
+    position: sticky;
+    top: 16px;
+    max-height: calc(100vh - 32px);
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #2a3142 transparent;
+  }
+}
+
+/* Take statistics: one quiet line instead of four boxes */
+.deck-telemetry {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin-top: 8px;
+  padding: 0 2px;
+}
+.telemetry-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  background: none;
+  border: 0;
+  padding: 0;
+}
+.t-label {
+  display: inline;
+  font-size: 11px;
+}
+.t-val {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+@media (max-width: 640px) {
+  .deck-telemetry {
+    display: flex;
+  }
+}
+
+/* Presets wrap inside the console so every option stays visible */
+.console-col .presets-list {
+  flex-wrap: wrap;
+  overflow-x: visible;
+  row-gap: 8px;
+}
+.console-col .presets-list.fade-left,
+.console-col .presets-list.fade-right {
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+.console-col > .presets-ribbon {
+  align-items: flex-start;
+}
+.console-col > .presets-ribbon .ribbon-label {
+  padding-top: 7px;
+}
+
+/* When the script footer wraps, keep the actions on the right */
+.script-actions {
+  margin-left: auto;
+}

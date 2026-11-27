@@ -156,33 +156,48 @@ def _apply_formant_shift(x: np.ndarray, fs: int, shift_pct: float) -> np.ndarray
 
 
 def _apply_deesser(x: np.ndarray, fs: int, amount: float) -> np.ndarray:
-    if amount <= 0.01:
-        return x
-    nyq = fs * 0.5
-    low = min(5200.0 / nyq, 0.92)
-    high = min(9200.0 / nyq, 0.98)
-    if low >= high:
-        return x
-    sos = signal.butter(3, [low, high], btype="bandpass", output="sos")
-    sib = signal.sosfilt(sos, x)
+    """Split-band de-esser: turn down the 4.5 kHz+ band only on frames dominated by sibilance.
 
-    sib_env = _envelope_follower(sib, fs, attack_ms=3.0, release_ms=35.0)
-    full_env = _envelope_follower(x, fs, attack_ms=5.0, release_ms=45.0) + 1e-6
+    Works in the STFT domain so the cut is exact (no phase-shifted band subtraction). The
+    maximum cut scales with `amount` (about 14 dB at 100%); vowels and voiced consonants,
+    whose energy sits below 4 kHz, are untouched.
+    """
+    if amount <= 0.01 or len(x) < 1024:
+        return x
+    nperseg, hop = 512, 128
+    f, _, Z = signal.stft(x, fs=fs, nperseg=nperseg, noverlap=nperseg - hop)
+    power = np.abs(Z) ** 2
+    hi = f >= 4500.0
+    if not np.any(hi):
+        return x
+    share_db = 10.0 * np.log10((power[hi].sum(axis=0) + 1e-12) / (power.sum(axis=0) + 1e-12))
+    level_db = 10.0 * np.log10(power.sum(axis=0) + 1e-12)
+    audible = level_db > level_db.max() - 45.0
 
-    ratio = sib_env / full_env
-    thresh = 0.22 - 0.08 * amount
-    excess = np.clip((ratio - thresh) / 0.35, 0.0, 1.0)
-    attenuation = excess * (0.72 * amount)
-    return x - sib * attenuation
+    max_cut_db = 14.0 * amount
+    cut_db = np.clip((share_db + 8.0) * 1.3, 0.0, max_cut_db) * audible
+    # Smooth over ~15 ms so the cut doesn't flutter between frames
+    cut_db = np.convolve(cut_db, np.ones(3) / 3, mode="same")
+
+    weight = np.clip((f - 3500.0) / 1500.0, 0.0, 1.0)[:, None]  # soft 3.5-5 kHz transition
+    gain = 10.0 ** (-(weight * cut_db[None, :]) / 20.0)
+    _, y = signal.istft(Z * gain, fs=fs, nperseg=nperseg, noverlap=nperseg - hop)
+    y = y[: len(x)]
+    if len(y) < len(x):
+        y = np.pad(y, (0, len(x) - len(y)))
+    return y
 
 
 def _apply_compressor(x: np.ndarray, fs: int, amount: float) -> np.ndarray:
+    """Soft-knee compressor whose threshold follows the speech level, so it acts at any input level."""
     if amount <= 0.01:
         return x
     env = _envelope_follower(x, fs, attack_ms=10.0, release_ms=95.0) + 1e-7
     env_db = 20.0 * np.log10(env)
 
-    threshold_db = -18.0 - 8.0 * amount
+    speech = env_db[env_db > env_db.max() - 40.0]
+    speech_ref_db = float(np.percentile(speech, 90)) if len(speech) else float(env_db.max())
+    threshold_db = speech_ref_db - (3.0 + 12.0 * amount)
     ratio = 1.5 + 3.0 * amount
     knee_db = 6.0
 
@@ -199,7 +214,7 @@ def _apply_compressor(x: np.ndarray, fs: int, amount: float) -> np.ndarray:
     y = x * (10.0 ** (-gain_reduction_db / 20.0))
     rms_in = float(np.sqrt(np.mean(x ** 2)) + 1e-7)
     rms_out = float(np.sqrt(np.mean(y ** 2)) + 1e-7)
-    return y * min(rms_in / rms_out, 2.5)
+    return y * min(rms_in / rms_out, 4.0)
 
 
 def _apply_room_ambience(x: np.ndarray, fs: int, amount: float) -> np.ndarray:
@@ -254,29 +269,66 @@ def _apply_pitch_shift(x: np.ndarray, fs: int, semitones: float) -> np.ndarray:
     return shifted.astype(np.float64)
 
 
-def _normalize_and_limit(x: np.ndarray, fs: int, target_lufs: float) -> np.ndarray:
-    if len(x) == 0:
-        return x
-    sos_hp = signal.butter(2, 60.0 / (fs * 0.5), btype="highpass", output="sos")
-    weighted = signal.sosfilt(sos_hp, x)
+def integrated_lufs(x: np.ndarray, fs: int) -> float:
+    """ITU-R BS.1770-4 integrated loudness: K-weighting, 400 ms blocks, absolute + relative gating."""
+    if len(x) < int(fs * 0.4):
+        return -70.0
+    # K-weighting stage 1: high shelf (+4 dB above ~1.5 kHz)
+    a_ = 10.0 ** (4.0 / 40.0)
+    w0 = 2.0 * math.pi * 1500.0 / fs
+    alpha = math.sin(w0) / (2.0 * (1.0 / math.sqrt(2.0)))
+    c = math.cos(w0)
+    b = [a_ * ((a_ + 1) + (a_ - 1) * c + 2 * math.sqrt(a_) * alpha),
+         -2 * a_ * ((a_ - 1) + (a_ + 1) * c),
+         a_ * ((a_ + 1) + (a_ - 1) * c - 2 * math.sqrt(a_) * alpha)]
+    a = [(a_ + 1) - (a_ - 1) * c + 2 * math.sqrt(a_) * alpha,
+         2 * ((a_ - 1) - (a_ + 1) * c),
+         (a_ + 1) - (a_ - 1) * c - 2 * math.sqrt(a_) * alpha]
+    y = signal.lfilter(np.array(b) / a[0], np.array(a) / a[0], x)
+    # K-weighting stage 2: high-pass at ~38 Hz
+    w0 = 2.0 * math.pi * 38.0 / fs
+    alpha = math.sin(w0) / (2.0 * 0.5)
+    c = math.cos(w0)
+    b = [(1 + c) / 2, -(1 + c), (1 + c) / 2]
+    a = [1 + alpha, -2 * c, 1 - alpha]
+    y = signal.lfilter(np.array(b) / a[0], np.array(a) / a[0], y)
 
-    active = weighted[np.abs(weighted) > 0.008]
-    if len(active) < int(fs * 0.05):
-        active = weighted
+    block, hop = int(0.4 * fs), int(0.1 * fs)
+    z = np.array([np.mean(y[i : i + block] ** 2) for i in range(0, len(y) - block + 1, hop)])
+    loud = -0.691 + 10.0 * np.log10(z + 1e-12)
+    z = z[loud > -70.0]
+    if len(z) == 0:
+        return -70.0
+    relative_gate = -0.691 + 10.0 * math.log10(float(np.mean(z))) - 10.0
+    z = z[(-0.691 + 10.0 * np.log10(z + 1e-12)) > relative_gate]
+    return -0.691 + 10.0 * math.log10(float(np.mean(z)) + 1e-12) if len(z) else -70.0
 
-    rms = float(np.sqrt(np.mean(active ** 2)) + 1e-8)
-    current_lufs = 20.0 * math.log10(rms) - 0.691
-    gain_db = np.clip(target_lufs - current_lufs, -12.0, 18.0)
-    y = x * (10.0 ** (gain_db / 20.0))
 
-    ceiling = 0.94
-    knee = 0.80
+def _soft_limit(y: np.ndarray, knee: float = 0.80, ceiling: float = 0.94) -> np.ndarray:
     mag = np.abs(y)
     over = mag > knee
     if np.any(over):
-        y[over] = np.sign(y[over]) * (
-            knee + (ceiling - knee) * np.tanh((mag[over] - knee) / (ceiling - knee))
-        )
+        y = y.copy()
+        y[over] = np.sign(y[over]) * (knee + (ceiling - knee) * np.tanh((mag[over] - knee) / (ceiling - knee)))
+    return y
+
+
+def _normalize_and_limit(x: np.ndarray, fs: int, target_lufs: float) -> np.ndarray:
+    """Normalize to a true BS.1770 integrated-loudness target, then soft-limit peaks.
+
+    The limiter shaves a little loudness off hot peaks, so the gain is corrected once
+    after limiting to land within a few tenths of a dB of the target.
+    """
+    if len(x) == 0:
+        return x
+    current = integrated_lufs(x, fs)
+    if current <= -69.0:
+        return x
+    gain_db = float(np.clip(target_lufs - current, -24.0, 30.0))
+    y = _soft_limit(x * (10.0 ** (gain_db / 20.0)))
+    error_db = target_lufs - integrated_lufs(y, fs)
+    if abs(error_db) > 0.2:
+        y = _soft_limit(x * (10.0 ** ((gain_db + error_db) / 20.0)))
     return y
 
 

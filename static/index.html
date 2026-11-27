@@ -54,18 +54,12 @@
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
           Save Preset
         </button>
-        <button class="btn btn-primary" id="btnExportCode" title="Export voice pack (.zip / .npy / .timbra.json) and API code for your apps">
+        <button class="btn btn-accent-outline" id="btnExportCode" title="Export voice pack (.zip / .npy / .timbra.json) and API code for your apps">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
           Export Voice
         </button>
       </div>
     </header>
-
-    <!-- Presets Ribbon -->
-    <section class="presets-ribbon">
-      <div class="ribbon-label">Presets</div>
-      <div class="presets-list" id="presetsList"></div>
-    </section>
 
     <!-- Main 2-Column Studio Workspace -->
     <main class="workspace">
@@ -201,21 +195,21 @@ Listen closely to the phrasing, the subtle breath between thoughts, and the soft
             </div>
           </div>
 
-          <div class="deck-telemetry">
+          <div class="deck-telemetry" aria-label="Take statistics">
             <div class="telemetry-item">
               <span class="t-label">Mode</span>
               <span class="t-val" id="telMode">—</span>
             </div>
             <div class="telemetry-item">
-              <span class="t-label">Inference</span>
+              <span class="t-label">Model</span>
               <span class="t-val" id="telInfer">—</span>
             </div>
             <div class="telemetry-item">
-              <span class="t-label">Mastering DSP</span>
+              <span class="t-label">DSP</span>
               <span class="t-val" id="telDsp">—</span>
             </div>
             <div class="telemetry-item">
-              <span class="t-label">Speed (RTF)</span>
+              <span class="t-label">RTF</span>
               <span class="t-val" id="telRtf">—</span>
             </div>
           </div>
@@ -230,6 +224,12 @@ Listen closely to the phrasing, the subtle breath between thoughts, and the soft
 
       <!-- RIGHT COLUMN: Tuning Console -->
       <section class="console-col">
+        <!-- Presets (next to the controls they set) -->
+        <section class="presets-ribbon" aria-label="Presets">
+          <div class="ribbon-label">Presets</div>
+          <div class="presets-list" id="presetsList"></div>
+        </section>
+
         <div class="card console-card">
           <nav class="console-tabs" role="tablist">
             <button class="tab-btn active" data-tab="blend" role="tab">
@@ -433,7 +433,7 @@ Listen closely to the phrasing, the subtle breath between thoughts, and the soft
                 <div class="toggle-row">
                   <div>
                     <div class="toggle-title">Sentence-Aware Breath Chunking</div>
-                    <div class="toggle-desc">Splits at sentence boundaries with smooth crossfades so pause timing is exact and never rushed.</div>
+                    <div class="toggle-desc">Synthesizes each sentence separately so the Sentence Pause you set is exactly the gap you hear.</div>
                   </div>
                   <label class="switch">
                     <input type="checkbox" id="continuousCheck" checked />
@@ -476,7 +476,7 @@ Listen closely to the phrasing, the subtle breath between thoughts, and the soft
                 </label>
                 <div>
                   <div class="toggle-title">Studio Mastering Chain</div>
-                  <div class="toggle-desc">Instant ~20ms re-mastering on your current take — no re-synthesis needed.</div>
+                  <div class="toggle-desc">Re-masters your current take without re-synthesizing (typically a fraction of a second).</div>
                 </div>
               </div>
               <button class="btn btn-xs btn-ghost" id="btnResetMastering">Flat Reset</button>
@@ -678,6 +678,7 @@ Listen closely to the phrasing, the subtle breath between thoughts, and the soft
                   </div>
                   <input type="range" id="rhythmHumanizeSlider" min="0" max="1" step="0.05" value="0.30" />
                   <div class="range-hints"><span>Metronomic</span><span>Natural (30%)</span><span>Spontaneous Pacing</span></div>
+                  <p class="section-desc">Varies each sentence's speed and pause slightly. Re-synthesizes the take, and only applies while the Humanizer is on.</p>
                 </div>
               </div>
             </div>

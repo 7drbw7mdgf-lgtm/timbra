@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -58,16 +59,36 @@ app = FastAPI(title="Kokoro & Chatterbox Studio", version="2.0.0")
 # other websites from driving the API while the studio is running).
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
 
+# Extra host names to accept, e.g. your Mac's Tailscale name when the studio is
+# shared privately with `tailscale serve`:
+#   TIMBRA_ALLOWED_HOSTS=my-mac.tail1234.ts.net ./run.sh
+EXTRA_ALLOWED_HOSTS = {
+    h.strip().lower() for h in os.environ.get("TIMBRA_ALLOWED_HOSTS", "").split(",") if h.strip()
+}
+ALLOWED_HOSTS = LOOPBACK_HOSTS | EXTRA_ALLOWED_HOSTS
+
+
+def _hostname(netloc: str) -> str:
+    netloc = netloc.strip().lower()
+    if netloc.startswith("["):  # IPv6 literal, with or without a port
+        return netloc[: netloc.find("]") + 1]
+    return netloc.rsplit(":", 1)[0]
+
 
 @app.middleware("http")
 async def same_origin_only(request: Request, call_next):
     host = request.headers.get("host", "")
-    hostname = host.rsplit(":", 1)[0] if not host.endswith("]") else host
-    if hostname not in LOOPBACK_HOSTS:
+    if _hostname(host) not in ALLOWED_HOSTS:
         return JSONResponse({"detail": "Forbidden host."}, status_code=403)
     origin = request.headers.get("origin")
-    if origin is not None and origin != f"{request.url.scheme}://{host}":
-        return JSONResponse({"detail": "Cross-origin requests are not allowed."}, status_code=403)
+    if origin is not None:
+        # A proxy such as `tailscale serve` terminates HTTPS and may rewrite the
+        # Host header, so compare host names rather than full origins: allow the
+        # page's own host, or an explicitly allowed host.
+        origin_netloc = origin.split("://", 1)[-1]
+        same_host = origin_netloc.lower() == host.lower()
+        if not same_host and _hostname(origin_netloc) not in EXTRA_ALLOWED_HOSTS:
+            return JSONResponse({"detail": "Cross-origin requests are not allowed."}, status_code=403)
     return await call_next(request)
 
 # Global engine state
@@ -175,6 +196,8 @@ class SynthesizeRequest(BaseModel):
     blend: list[VoiceWeight] = Field(default_factory=lambda: [VoiceWeight(voice="af_heart", weight=1.0)])
     split_mode: bool = False
     prosody_voice: str = "af_heart"
+    # "preserve" keeps the blend as strong as its parts (see _blend_styles); "linear" is a plain average
+    blend_mode: str = "preserve"
     prosody_intensity: float = Field(default=1.0, ge=0.4, le=1.6)
     style_offset: int = Field(default=0, ge=-40, le=80)
     speed: float = Field(default=0.92, ge=0.55, le=1.6)
@@ -263,6 +286,27 @@ def _preprocess_text(
     return cleaned
 
 
+def _blend_styles(styles: list[np.ndarray], weights: list[float], preserve_strength: bool = True) -> np.ndarray:
+    """Mix Kokoro style tensors (510, 1, 256): the timbre half [:128] and prosody half [128:].
+
+    A plain weighted average of two different voices is a shorter vector than either voice
+    (6-21% shorter for typical pairs), which pulls the blend toward a generic, flatter voice.
+    With preserve_strength, each row's timbre and prosody halves are rescaled to the weighted
+    average length of the voices being mixed, so the blend keeps its parts' character while
+    pointing in the blended direction (a normalized interpolation, like slerp for 2 voices).
+    """
+    out = np.zeros_like(styles[0], dtype=np.float32)
+    for s_, w in zip(styles, weights):
+        out += float(w) * s_.astype(np.float32)
+    if not preserve_strength or len(styles) == 1:
+        return out
+    for half in (slice(0, 128), slice(128, 256)):
+        target = sum(float(w) * np.linalg.norm(s_[:, :, half], axis=-1, keepdims=True) for s_, w in zip(styles, weights))
+        current = np.linalg.norm(out[:, :, half], axis=-1, keepdims=True)
+        out[:, :, half] *= target / np.maximum(current, 1e-6)
+    return out
+
+
 def _build_style_tensor(req: SynthesizeRequest) -> tuple[np.ndarray, str]:
     assert kokoro is not None
     valid_items = [
@@ -275,10 +319,11 @@ def _build_style_tensor(req: SynthesizeRequest) -> tuple[np.ndarray, str]:
     total_w = sum(i.weight for i in valid_items)
     primary_voice = max(valid_items, key=lambda x: x.weight).voice
 
-    style = np.zeros_like(kokoro.get_voice_style(valid_items[0].voice), dtype=np.float32)
-    for item in valid_items:
-        w = item.weight / total_w
-        style += w * kokoro.get_voice_style(item.voice)
+    style = _blend_styles(
+        [kokoro.get_voice_style(i.voice) for i in valid_items],
+        [i.weight / total_w for i in valid_items],
+        preserve_strength=req.blend_mode != "linear",
+    )
 
     # Optional Split Timbre / Prosody: borrow prosody half [:, :, 128:] from another voice
     if req.split_mode and req.prosody_voice in kokoro.voices.files:
@@ -375,6 +420,76 @@ def _split_phonemes(phonemes: str, max_len: int = 440) -> list[str]:
     return chunks
 
 
+_SENTENCE_MARKS = ".!?…"
+_CLAUSE_MARKS = ",;:"
+
+
+def _retime_internal_pauses(
+    seg: np.ndarray, phonemes: str, sr: int, sentence_pause: float, clause_pause: float
+) -> np.ndarray:
+    """Set the pauses Kokoro leaves at commas (and mid-chunk full stops) to the requested length.
+
+    The ONNX backend does this from the model's phoneme timings; the MLX model only returns
+    audio, so each punctuation mark is matched to the quiet run nearest its relative position
+    in the utterance, and that run is resized. Marks with no clear pause nearby are left alone.
+    """
+    marks = [
+        (i, _SENTENCE_MARKS.find(ch) >= 0)
+        for i, ch in enumerate(phonemes[:-1])
+        if ch in _CLAUSE_MARKS + _SENTENCE_MARKS and phonemes[i + 1].isspace() and phonemes[:i].strip()
+    ]
+    if not marks or len(seg) < sr // 4:
+        return seg
+
+    frame = int(sr * 0.01)
+    n_frames = len(seg) // frame
+    rms = np.sqrt(np.mean(seg[: n_frames * frame].reshape(n_frames, frame) ** 2, axis=1))
+    quiet = rms <= float(rms.max()) * 10 ** (-40 / 20)
+    runs: list[tuple[int, int]] = []  # internal quiet runs >= 60 ms, in frames
+    i = 0
+    while i < n_frames:
+        if quiet[i]:
+            j = i
+            while j < n_frames and quiet[j]:
+                j += 1
+            if i > 0 and j < n_frames and j - i >= 6:
+                runs.append((i, j))
+            i = j
+        else:
+            i += 1
+    if not runs:
+        return seg
+
+    total = len(phonemes)
+    assigned: list[tuple[int, int, float]] = []
+    last_run = -1
+    for pos, is_sentence in marks:
+        frac = (pos + 1) / total
+        candidates = [
+            (k, r) for k, r in enumerate(runs)
+            if k > last_run and abs((r[0] + r[1]) / 2 / n_frames - frac) <= 0.12
+        ]
+        if not candidates:
+            continue
+        k, (a, b) = max(candidates, key=lambda kr: kr[1][1] - kr[1][0])
+        last_run = k
+        assigned.append((a * frame, b * frame, sentence_pause if is_sentence else clause_pause))
+
+    if not assigned:
+        return seg
+    pieces: list[np.ndarray] = []
+    cursor = 0
+    edge = int(sr * 0.015)
+    for a, b, wanted in assigned:
+        target = int(round(max(0.0, wanted) * sr))
+        e = min(edge, (b - a) // 2, target // 2)
+        pieces.append(seg[cursor : a + e])
+        pieces.append(np.zeros(max(0, target - 2 * e), dtype=seg.dtype))
+        cursor = b - e
+    pieces.append(seg[cursor:])
+    return np.concatenate(pieces)
+
+
 def _infer_kokoro_from_phonemes(
     phonemes: str,
     style: str | np.ndarray,
@@ -401,6 +516,7 @@ def _infer_kokoro_from_phonemes(
                 mx.eval(out)
                 seg = np.asarray(out, dtype=np.float32).ravel()
                 if len(seg) > 0:
+                    seg = _retime_internal_pauses(seg, chunk, SAMPLE_RATE, sentence_pause, clause_pause)
                     parts.append(_fade_edges(seg, SAMPLE_RATE, ms=4.0))
         return (np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)), SAMPLE_RATE
 
