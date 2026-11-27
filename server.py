@@ -111,6 +111,16 @@ chatterbox_status: str = "not_loaded"  # not_loaded | loading | ready | error
 chatterbox_error: str | None = None
 chatterbox_lock = threading.Lock()
 chatterbox_conds_cache: OrderedDict[str, Any] = OrderedDict()
+# MLX ties not-yet-evaluated arrays to the thread that made them, so the Chatterbox model
+# and its cached voice conditionals only work on the thread that loaded them. Every use
+# goes through this one thread.
+_chatterbox_thread = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chatterbox")
+
+
+def _on_chatterbox_thread(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    if threading.current_thread().name.startswith("chatterbox"):
+        return fn(*args, **kwargs)
+    return _chatterbox_thread.submit(fn, *args, **kwargs).result()
 
 # Japanese G2P. Kokoro's Japanese voices were trained on misaki's converter; espeak
 # can only read kana and turns every kanji into the English words "Chinese letter".
@@ -943,47 +953,48 @@ class _StreamCancelled(Exception):
     """Raised inside synthesis when the listener has gone away."""
 
 
-@app.post("/api/synthesize-stream")
-def synthesize_stream(req: SynthesizeRequest, request: Request) -> StreamingResponse:
-    """Like /api/synthesize, but sends each sentence as soon as it is made.
+def _stream_take(request: Request, sr: int, mastering: MasteringRequest, run: Any) -> StreamingResponse:
+    """Run run(on_segment) in a worker and stream its pieces as newline-delimited JSON.
 
-    The response is newline-delimited JSON:
       {"type": "chunk", "index": n, "sample_rate": sr, "pcm16": <base64 little-endian int16>}
         one per sentence (with the pause after it), mastered on its own so it can be
-        played straight away; the chunks line up with the final take's timeline;
-      {"type": "done", ...same fields as /api/synthesize...}
+        played straight away; the chunks line up with the final take's timeline.
+        Chatterbox chunks also carry "progress": the share of the text made so far;
+      {"type": "done", ...whatever run() returned...}
         the finished take, mastered as a whole (this is what gets saved);
       {"type": "error", "detail": "..."}
     If the client disconnects, synthesis stops at the next sentence.
     """
-    prepared = _prepare_synthesis(req)  # validation errors are normal HTTP errors
-    params = _to_mastering_params(req.mastering)
+    params = _to_mastering_params(mastering)
     events: queue.Queue = queue.Queue()
     cancelled = threading.Event()
     pool = ThreadPoolExecutor(max_workers=1)  # one worker keeps chunks in order
     futures: list[Any] = []
 
-    def master_chunk(index: int, seg: np.ndarray) -> None:
+    def master_chunk(index: int, seg: np.ndarray, progress: float | None) -> None:
         if cancelled.is_set():
             return
-        y = apply_mastering(seg, SAMPLE_RATE, params)
+        y = apply_mastering(seg, sr, params)
         pcm = (np.clip(y, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
-        events.put({
+        ev: dict[str, Any] = {
             "type": "chunk",
             "index": index,
-            "sample_rate": SAMPLE_RATE,
+            "sample_rate": sr,
             "pcm16": base64.b64encode(pcm).decode("ascii"),
-        })
+        }
+        if progress is not None:
+            ev["progress"] = round(float(progress), 4)
+        events.put(ev)
 
-    def on_segment(seg: np.ndarray) -> None:
+    def on_segment(seg: np.ndarray, progress: float | None = None) -> None:
         if cancelled.is_set():
             raise _StreamCancelled()
         # Master the preview on the side so the next sentence's inference isn't held up.
-        futures.append(pool.submit(master_chunk, len(futures), seg.copy()))
+        futures.append(pool.submit(master_chunk, len(futures), seg.copy(), progress))
 
     def work() -> None:
         try:
-            result = _run_synthesis(req, prepared, on_segment=on_segment)
+            result = run(on_segment)
             for f in futures:
                 f.result()
             events.put({"type": "done", **result})
@@ -1018,6 +1029,16 @@ def synthesize_stream(req: SynthesizeRequest, request: Request) -> StreamingResp
             cancelled.set()
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+@app.post("/api/synthesize-stream")
+def synthesize_stream(req: SynthesizeRequest, request: Request) -> StreamingResponse:
+    """Like /api/synthesize, but sends each sentence as soon as it is made (see _stream_take)."""
+    prepared = _prepare_synthesis(req)  # validation errors are normal HTTP errors
+    return _stream_take(
+        request, SAMPLE_RATE, req.mastering,
+        lambda on_segment: _run_synthesis(req, prepared, on_segment=on_segment),
+    )
 
 
 @app.post("/api/remaster")
@@ -1290,6 +1311,8 @@ def _get_chatterbox() -> Any:
     global chatterbox_model, chatterbox_status, chatterbox_error
     if chatterbox_model is not None:
         return chatterbox_model
+    if not threading.current_thread().name.startswith("chatterbox"):
+        return _on_chatterbox_thread(_get_chatterbox)
     with chatterbox_lock:
         if chatterbox_model is not None:
             return chatterbox_model
@@ -1483,8 +1506,12 @@ def _get_chatterbox_conds(model: Any, ref_id: str | None, exaggeration: float) -
     return Conditionals(t3c, base_conds.gen), ref_label
 
 
-def _chunk_text_for_chatterbox(text: str, max_chars: int = 230) -> list[list[str]]:
-    """Split text into paragraphs -> cleanly bounded sentence chunks for stable autoregressive synthesis."""
+def _chunk_text_for_chatterbox(text: str, min_chars: int = 12, max_chars: int = 230) -> list[list[str]]:
+    """Split text into paragraphs -> one chunk per sentence.
+
+    One sentence at a time keeps autoregressive synthesis stable, puts the sentence pause
+    after every sentence, and lets a take be played while the rest is made. A very short
+    sentence ("Yes.") joins the next one, since Chatterbox garbles tiny inputs."""
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
     out: list[list[str]] = []
     for para in paragraphs:
@@ -1497,24 +1524,33 @@ def _chunk_text_for_chatterbox(text: str, max_chars: int = 230) -> list[list[str
         grouped: list[str] = []
         buf = ""
         for s in sents:
-            if buf and len(buf) + 1 + len(s) > max_chars:
+            if buf and (len(buf) >= min_chars or len(buf) + 1 + len(s) > max_chars):
                 grouped.append(buf)
                 buf = s
             else:
                 buf = f"{buf} {s}".strip() if buf else s
         if buf:
-            grouped.append(buf)
+            if grouped and len(buf) < min_chars and len(grouped[-1]) + 1 + len(buf) <= max_chars:
+                grouped[-1] = f"{grouped[-1]} {buf}"
+            else:
+                grouped.append(buf)
         if grouped:
             out.append(grouped)
     return out
 
 
-@app.post("/api/chatterbox/synthesize")
-def synthesize_chatterbox(req: ChatterboxSynthesizeRequest) -> dict[str, Any]:
+def _prepare_chatterbox(req: ChatterboxSynthesizeRequest) -> str:
     processed_text = _preprocess_text(req.text, req.smart_punctuation, req.pronunciation_rules)
     if not processed_text:
         raise HTTPException(status_code=400, detail="Please enter some text to synthesize.")
+    return processed_text
 
+
+def _run_chatterbox(
+    req: ChatterboxSynthesizeRequest, processed_text: str, on_segment: Any = None
+) -> dict[str, Any]:
+    """Make a Chatterbox take. on_segment, if given, gets each finished chunk (plus the
+    pause after it) as soon as it is made; together they make up the dry take."""
     model = _get_chatterbox()
     sr = int(getattr(model, "sample_rate", SAMPLE_RATE))
 
@@ -1523,11 +1559,21 @@ def synthesize_chatterbox(req: ChatterboxSynthesizeRequest) -> dict[str, Any]:
         conds, ref_label = _get_chatterbox_conds(model, req.ref_id, req.exaggeration)
         para_chunks = _chunk_text_for_chatterbox(processed_text)
         segments: list[np.ndarray] = []
+        emitted = 0
+        total_chars = max(1, sum(len(c) for sents in para_chunks for c in sents))
+        done_chars = 0
         rh = float(np.clip(req.rhythm_humanize, 0.0, 1.0)) if req.mastering.humanize_enabled else 0.0
         rng = np.random.default_rng(abs(hash(processed_text[:64])) % (2**31 - 1))
 
+        def flush() -> None:
+            nonlocal emitted
+            if on_segment is not None and len(segments) > emitted:
+                on_segment(np.concatenate(segments[emitted:]), progress=done_chars / total_chars)
+                emitted = len(segments)
+
         for p_idx, sentences in enumerate(para_chunks):
             for s_idx, chunk_text in enumerate(sentences):
+                flush()
                 chunk_temp = float(
                     np.clip(req.temperature + float(rng.uniform(-0.05, 0.05)) * rh, 0.15, 1.45)
                 )
@@ -1548,6 +1594,7 @@ def synthesize_chatterbox(req: ChatterboxSynthesizeRequest) -> dict[str, Any]:
                 if gen_parts:
                     seg = np.concatenate(gen_parts)
                     segments.append(_fade_edges(_trim_silence(seg, sr), sr, ms=6.0))
+                done_chars += len(chunk_text)
                 if s_idx < len(sentences) - 1 and req.sentence_pause > 0:
                     p_scale = 1.0 + float(rng.uniform(-0.34, 0.40)) * rh
                     sp_n = int(round(max(0.06, req.sentence_pause * p_scale) * sr))
@@ -1556,6 +1603,7 @@ def synthesize_chatterbox(req: ChatterboxSynthesizeRequest) -> dict[str, Any]:
                 pp_scale = 1.0 + float(rng.uniform(-0.22, 0.28)) * rh
                 pp_n = int(round(max(0.12, req.paragraph_pause * pp_scale) * sr))
                 segments.append(np.zeros(pp_n, dtype=np.float32))
+        flush()
 
     dry_audio = np.concatenate(segments) if segments else np.zeros(0, dtype=np.float32)
     infer_s = time.perf_counter() - t0
@@ -1599,6 +1647,24 @@ def synthesize_chatterbox(req: ChatterboxSynthesizeRequest) -> dict[str, Any]:
         "processed_text": processed_text,
         "phonemes": "",
     }
+
+
+@app.post("/api/chatterbox/synthesize")
+def synthesize_chatterbox(req: ChatterboxSynthesizeRequest) -> dict[str, Any]:
+    return _on_chatterbox_thread(_run_chatterbox, req, _prepare_chatterbox(req))
+
+
+@app.post("/api/chatterbox/synthesize-stream")
+def synthesize_chatterbox_stream(req: ChatterboxSynthesizeRequest, request: Request) -> StreamingResponse:
+    """Like /api/chatterbox/synthesize, but sends each chunk as soon as it is made (see _stream_take)."""
+    processed_text = _prepare_chatterbox(req)
+    sr = int(getattr(_get_chatterbox(), "sample_rate", SAMPLE_RATE))
+    return _stream_take(
+        request, sr, req.mastering,
+        lambda on_segment: _on_chatterbox_thread(
+            _run_chatterbox, req, processed_text, on_segment=on_segment
+        ),
+    )
 
 
 # ---------- Voice Export & OpenAI-Compatible App Narration API (/v1/audio/speech) ----------
@@ -1823,48 +1889,53 @@ def openai_audio_speech(req: OpenAISpeechRequest) -> Response:
         m_params = _mastering_from_dict(cfg.get("mastering"))
 
         if vdata.get("engine") == "chatterbox":
-            model = _get_chatterbox()
-            sr = int(getattr(model, "sample_rate", SAMPLE_RATE))
-            ref_file = voice_dir / "reference.wav"
-            with chatterbox_lock:
-                if ref_file.exists():
-                    import mlx.core as mx
-                    wav, rsr = sf.read(str(ref_file), dtype="float32")
-                    if wav.ndim > 1:
-                        wav = np.mean(wav, axis=1)
-                    conds = model.prepare_conditionals(
-                        mx.array(wav.astype(np.float32)),
-                        int(rsr),
-                        exaggeration=float(cfg.get("exaggeration", 0.55)),
-                    )
-                else:
-                    conds, _ = _get_chatterbox_conds(model, cfg.get("ref_id"), float(cfg.get("exaggeration", 0.55)))
 
-                para_chunks = _chunk_text_for_chatterbox(processed)
-                segs: list[np.ndarray] = []
-                sent_p = float(cfg.get("sentence_pause", 0.30))
-                para_p = float(cfg.get("paragraph_pause", 0.60))
-                for pi, sents in enumerate(para_chunks):
-                    for si, chunk_txt in enumerate(sents):
-                        parts = [
-                            np.asarray(res.audio, dtype=np.float32).ravel()
-                            for res in model.generate(
-                                text=chunk_txt,
-                                conds=conds,
-                                exaggeration=float(cfg.get("exaggeration", 0.55)),
-                                cfg_weight=float(cfg.get("cfg_weight", 0.50)),
-                                temperature=float(cfg.get("temperature", 0.80)),
-                                repetition_penalty=float(cfg.get("repetition_penalty", 1.20)),
-                                verbose=False,
-                            )
-                        ]
-                        if parts:
-                            segs.append(_fade_edges(_trim_silence(np.concatenate(parts), sr), sr, ms=6.0))
-                        if si < len(sents) - 1 and sent_p > 0:
-                            segs.append(np.zeros(int(sent_p * sr), dtype=np.float32))
-                    if pi < len(para_chunks) - 1 and para_p > 0:
-                        segs.append(np.zeros(int(para_p * sr), dtype=np.float32))
-                dry = np.concatenate(segs) if segs else np.zeros(0, dtype=np.float32)
+            def make_dry() -> tuple[np.ndarray, int]:
+                model = _get_chatterbox()
+                sr = int(getattr(model, "sample_rate", SAMPLE_RATE))
+                ref_file = voice_dir / "reference.wav"
+                with chatterbox_lock:
+                    if ref_file.exists():
+                        import mlx.core as mx
+                        wav, rsr = sf.read(str(ref_file), dtype="float32")
+                        if wav.ndim > 1:
+                            wav = np.mean(wav, axis=1)
+                        conds = model.prepare_conditionals(
+                            mx.array(wav.astype(np.float32)),
+                            int(rsr),
+                            exaggeration=float(cfg.get("exaggeration", 0.55)),
+                        )
+                    else:
+                        conds, _ = _get_chatterbox_conds(model, cfg.get("ref_id"), float(cfg.get("exaggeration", 0.55)))
+
+                    para_chunks = _chunk_text_for_chatterbox(processed)
+                    segs: list[np.ndarray] = []
+                    sent_p = float(cfg.get("sentence_pause", 0.30))
+                    para_p = float(cfg.get("paragraph_pause", 0.60))
+                    for pi, sents in enumerate(para_chunks):
+                        for si, chunk_txt in enumerate(sents):
+                            parts = [
+                                np.asarray(res.audio, dtype=np.float32).ravel()
+                                for res in model.generate(
+                                    text=chunk_txt,
+                                    conds=conds,
+                                    exaggeration=float(cfg.get("exaggeration", 0.55)),
+                                    cfg_weight=float(cfg.get("cfg_weight", 0.50)),
+                                    temperature=float(cfg.get("temperature", 0.80)),
+                                    repetition_penalty=float(cfg.get("repetition_penalty", 1.20)),
+                                    verbose=False,
+                                )
+                            ]
+                            if parts:
+                                segs.append(_fade_edges(_trim_silence(np.concatenate(parts), sr), sr, ms=6.0))
+                            if si < len(sents) - 1 and sent_p > 0:
+                                segs.append(np.zeros(int(sent_p * sr), dtype=np.float32))
+                        if pi < len(para_chunks) - 1 and para_p > 0:
+                            segs.append(np.zeros(int(para_p * sr), dtype=np.float32))
+                    dry = np.concatenate(segs) if segs else np.zeros(0, dtype=np.float32)
+                return dry, sr
+
+            dry, sr = _on_chatterbox_thread(make_dry)
             mastered = apply_mastering(dry, sr, m_params)
             payload_bytes, mime = _encode_audio_bytes(mastered, sr, req.response_format)
             return Response(content=payload_bytes, media_type=mime)

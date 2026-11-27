@@ -847,6 +847,7 @@ const preview = {
   nextAt: 0,
   timeline: 0,
   rafId: 0,
+  startedAt: 0, // performance.now() when the request went out
 };
 let waveformEmptyHtml = null;
 
@@ -875,6 +876,7 @@ function startPreview() {
   preview.pending = [];
   preview.nextAt = 0;
   preview.timeline = 0;
+  preview.startedAt = performance.now();
   return true;
 }
 
@@ -920,7 +922,28 @@ function queuePreviewChunk(chunk) {
   buf.copyToChannel(samples, 0);
   preview.pending.push(buf);
   const buffered = preview.pending.reduce((s, b) => s + b.duration, 0);
-  if (preview.items.length || buffered >= PREVIEW_START_BUFFER_S) flushPreviewPending();
+  if (
+    preview.items.length ||
+    (buffered >= PREVIEW_START_BUFFER_S && canPlayThrough(buffered, chunk.progress))
+  ) {
+    flushPreviewPending();
+  } else {
+    setPreviewNote(`Making the take… ${Math.floor(buffered)} s ready, starts once it can play without pauses`);
+  }
+}
+
+// An engine slower than real time (Chatterbox on a busy Mac) would run dry partway and
+// leave long silences. From how fast audio has come so far and how much of the text is
+// done ("progress"), wait until what's in hand lasts until the rest is made.
+function canPlayThrough(buffered, progress) {
+  if (progress == null || progress >= 1) return true;
+  const elapsed = (performance.now() - preview.startedAt) / 1000;
+  if (elapsed <= 0 || progress <= 0) return false;
+  const rate = buffered / elapsed; // seconds of audio made per second
+  if (rate >= 1.1) return true;
+  const remainingMake = (elapsed * (1 - progress)) / progress;
+  // Audio arrives a sentence at a time, so keep a margin.
+  return buffered >= remainingMake * (1 - rate) * 1.15 + 1.5;
 }
 
 function flushPreviewPending() {
@@ -1023,10 +1046,10 @@ function handPreviewToPlayer(keepPlaying) {
   }
 }
 
-// POST /api/synthesize-stream: play sentences as they come, resolve with the finished take.
-async function streamSynthesis(payload, signal, seq) {
+// POST to a *-stream endpoint: play sentences as they come, resolve with the finished take.
+async function streamSynthesis(url, payload, signal, seq) {
   const playable = startPreview();
-  const res = await fetch("/api/synthesize-stream", {
+  const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -1324,12 +1347,18 @@ async function synthesize(opts = {}) {
         pronunciation_rules: state.pronunciationRules.filter((r) => r.find.trim()),
         mastering: readMasteringConfig(),
       };
-      res = await fetch("/api/chatterbox/synthesize", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(cbPayload),
-        signal: controller.signal,
-      });
+      if (isLive) {
+        res = await fetch("/api/chatterbox/synthesize", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(cbPayload),
+          signal: controller.signal,
+        });
+      } else {
+        data = await streamSynthesis(
+          "/api/chatterbox/synthesize-stream", cbPayload, controller.signal, seq
+        );
+      }
     } else {
       const cfg = readFullConfig();
       const sortedBlend = [...cfg.blend].sort((a, b) => b.weight - a.weight);
@@ -1362,7 +1391,7 @@ async function synthesize(opts = {}) {
           signal: controller.signal,
         });
       } else {
-        data = await streamSynthesis(payload, controller.signal, seq);
+        data = await streamSynthesis("/api/synthesize-stream", payload, controller.signal, seq);
       }
     }
 
