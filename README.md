@@ -53,6 +53,16 @@ chmod +x setup.sh run.sh
 
 Then open **http://127.0.0.1:8765** in your browser.
 
+### Optional: Japanese voices
+
+Kokoro's Japanese voices need misaki's Japanese converter to read kanji (espeak alone only handles kana). It is about 78 MB with its dictionary:
+
+```bash
+.venv/bin/pip install misaki fugashi jaconv mojimoji unidic-lite pyopenjtalk-plus
+```
+
+Restart Timbra afterwards. `GET /api/health` reports `"japanese_g2p": "misaki"` once it is active. Without it, Japanese text containing kanji is rejected with a message rather than mispronounced.
+
 ---
 
 ## Architecture

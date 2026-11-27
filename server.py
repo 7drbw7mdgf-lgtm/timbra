@@ -112,6 +112,14 @@ chatterbox_error: str | None = None
 chatterbox_lock = threading.Lock()
 chatterbox_conds_cache: OrderedDict[str, Any] = OrderedDict()
 
+# Japanese G2P. Kokoro's Japanese voices were trained on misaki's converter; espeak
+# can only read kana and turns every kanji into the English words "Chinese letter".
+JA_G2P_INSTALL = "pip install misaki fugashi jaconv mojimoji unidic-lite pyopenjtalk-plus"
+_KANJI_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+ja_g2p: Any = None
+ja_g2p_error: str | None = None
+ja_g2p_lock = threading.Lock()
+
 
 def _init_engine() -> None:
     global kokoro, mlx_kokoro, kokoro_backend, voice_catalog, mean_prosody_vec
@@ -387,15 +395,52 @@ def _trim_silence(
     return seg[start:end]
 
 
+def _get_ja_g2p() -> Any:
+    """Load misaki's Japanese G2P once; None if its packages aren't installed."""
+    global ja_g2p, ja_g2p_error
+    if ja_g2p is None and ja_g2p_error is None:
+        with ja_g2p_lock:
+            if ja_g2p is None and ja_g2p_error is None:
+                try:
+                    from misaki import ja
+
+                    ja_g2p = ja.JAG2P()
+                except Exception as exc:  # ImportError, or a missing dictionary
+                    ja_g2p_error = f"{type(exc).__name__}: {exc}"
+    return ja_g2p
+
+
+def _phonemize_japanese(text: str) -> str:
+    g2p = _get_ja_g2p()
+    if g2p is not None:
+        with ja_g2p_lock:
+            phonemes, _ = g2p(text)
+        return phonemes
+    if _KANJI_RE.search(text):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Japanese text with kanji needs the misaki Japanese converter, which isn't installed "
+                f"in Timbra's environment. Install it with: {JA_G2P_INSTALL} "
+                "(then restart Timbra), or write the text in kana."
+            ),
+        )
+    assert kokoro is not None
+    return kokoro.tokenizer.phonemize(text, lang="ja")
+
+
 def _phonemize_cached(text: str, lang: str) -> str:
-    """Cached espeak phonemization so slider tweaks spend 0 ms re-phonemizing."""
+    """Cached phonemization (espeak, or misaki for Japanese) so slider tweaks skip re-phonemizing."""
     assert kokoro is not None
     key = (text, lang)
     cached = phoneme_cache.get(key)
     if cached is not None:
         phoneme_cache.move_to_end(key)
         return cached
-    ph = kokoro.tokenizer.phonemize(text, lang=lang)
+    if lang.startswith("ja"):
+        ph = _phonemize_japanese(text)
+    else:
+        ph = kokoro.tokenizer.phonemize(text, lang=lang)
     phoneme_cache[key] = ph
     while len(phoneme_cache) > 512:
         phoneme_cache.popitem(last=False)
@@ -683,6 +728,7 @@ def health() -> dict[str, Any]:
         "chatterbox_status": chatterbox_status,
         "chatterbox_model": CHATTERBOX_MODEL_ID,
         "chatterbox_error": chatterbox_error,
+        "japanese_g2p": "misaki" if _get_ja_g2p() is not None else "espeak (kana only)",
     }
 
 
@@ -1892,7 +1938,7 @@ def openai_audio_speech(req: OpenAISpeechRequest) -> Response:
             status_code=404,
             detail=f"Voice '{voice_id}' not found. Export a voice in Timbra or inspect GET /v1/audio/voices.",
         )
-    lang = "en-gb" if resolved_voice.startswith(("bf_", "bm_")) else "en-us"
+    lang = next((v["lang_code"] for v in voice_catalog if v["id"] == resolved_voice), "en-us")
     dry, sr, _ = _synthesize_paragraphs(
         text,
         style=resolved_voice,
