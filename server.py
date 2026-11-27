@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import io
 import json
 import os
+import queue
 import re
 import subprocess
 import tempfile
@@ -12,13 +15,14 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from kokoro_onnx import Kokoro
 from pydantic import BaseModel, Field
@@ -544,7 +548,14 @@ def _synthesize_paragraphs(
     continuous: bool,
     is_phonemes: bool = False,
     rhythm_humanize: float = 0.0,
+    on_segment: Any = None,
 ) -> tuple[np.ndarray, int, str]:
+    """Synthesize paragraph by paragraph (and sentence by sentence when splitting).
+
+    If `on_segment` is given it is called with each finished piece of the take, in
+    order: one sentence (or unsplit paragraph) plus the pause after it. The pieces
+    join up to exactly the returned audio, so a client can start playing them early.
+    """
     assert kokoro is not None
 
     if is_phonemes:
@@ -561,6 +572,14 @@ def _synthesize_paragraphs(
     phoneme_paragraphs: list[str] = []
     rh = float(np.clip(rhythm_humanize, 0.0, 1.0))
     rng = np.random.default_rng(abs(hash(text[:64])) % (2**31 - 1))
+    emitted = 0
+
+    def flush() -> None:
+        # Hand the previous sentence and its trailing pause(s) to the listener.
+        nonlocal emitted
+        if on_segment is not None and len(segments) > emitted:
+            on_segment(np.concatenate(segments[emitted:]))
+            emitted = len(segments)
 
     for i, para in enumerate(paragraphs):
         para_clean = re.sub(r"\s*\n\s*", " ", para)
@@ -582,6 +601,7 @@ def _synthesize_paragraphs(
                 jitter = float(rng.uniform(-0.045, 0.045)) * rh
                 sent_speed = float(np.clip(speed * (1.0 + len_bias + jitter), 0.62, 1.50))
 
+            flush()
             ph = _phonemize_cached(sent, lang)
             para_phs.append(ph)
             seg, _ = _infer_kokoro_from_phonemes(
@@ -609,6 +629,7 @@ def _synthesize_paragraphs(
             pp_n = int(round(max(0.12, paragraph_pause * pp_scale) * SAMPLE_RATE))
             segments.append(np.zeros(pp_n, dtype=np.float32))
 
+    flush()
     audio_out = np.concatenate(segments) if segments else np.zeros(0, dtype=np.float32)
     return audio_out, SAMPLE_RATE, "\n\n".join(phoneme_paragraphs)
 
@@ -765,8 +786,8 @@ def synthesize_raw(req: SynthesizeRawRequest) -> dict[str, Any]:
     }
 
 
-@app.post("/api/synthesize")
-def synthesize(req: SynthesizeRequest) -> dict[str, Any]:
+def _prepare_synthesis(req: SynthesizeRequest) -> tuple[str, str, np.ndarray, str]:
+    """Validate the request and build its text and voice style (raises HTTP errors)."""
     if kokoro is None:
         raise HTTPException(status_code=503, detail="Kokoro engine not ready.")
 
@@ -782,6 +803,15 @@ def synthesize(req: SynthesizeRequest) -> dict[str, Any]:
         synth_input = processed_text
 
     style_tensor, primary_voice = _build_style_tensor(req)
+    return synth_input, processed_text, style_tensor, primary_voice
+
+
+def _run_synthesis(
+    req: SynthesizeRequest,
+    prepared: tuple[str, str, np.ndarray, str],
+    on_segment: Any = None,
+) -> dict[str, Any]:
+    synth_input, processed_text, style_tensor, primary_voice = prepared
 
     t0 = time.perf_counter()
     dry_tuned, sr, phonemes_used = _synthesize_paragraphs(
@@ -795,6 +825,7 @@ def synthesize(req: SynthesizeRequest) -> dict[str, Any]:
         continuous=req.continuous,
         is_phonemes=req.use_custom_phonemes,
         rhythm_humanize=req.rhythm_humanize if req.mastering.humanize_enabled else 0.0,
+        on_segment=on_segment,
     )
     infer_s = time.perf_counter() - t0
 
@@ -855,6 +886,92 @@ def synthesize(req: SynthesizeRequest) -> dict[str, Any]:
         "processed_text": processed_text,
         "phonemes": phonemes_used,
     }
+
+
+@app.post("/api/synthesize")
+def synthesize(req: SynthesizeRequest) -> dict[str, Any]:
+    return _run_synthesis(req, _prepare_synthesis(req))
+
+
+class _StreamCancelled(Exception):
+    """Raised inside synthesis when the listener has gone away."""
+
+
+@app.post("/api/synthesize-stream")
+def synthesize_stream(req: SynthesizeRequest, request: Request) -> StreamingResponse:
+    """Like /api/synthesize, but sends each sentence as soon as it is made.
+
+    The response is newline-delimited JSON:
+      {"type": "chunk", "index": n, "sample_rate": sr, "pcm16": <base64 little-endian int16>}
+        one per sentence (with the pause after it), mastered on its own so it can be
+        played straight away; the chunks line up with the final take's timeline;
+      {"type": "done", ...same fields as /api/synthesize...}
+        the finished take, mastered as a whole (this is what gets saved);
+      {"type": "error", "detail": "..."}
+    If the client disconnects, synthesis stops at the next sentence.
+    """
+    prepared = _prepare_synthesis(req)  # validation errors are normal HTTP errors
+    params = _to_mastering_params(req.mastering)
+    events: queue.Queue = queue.Queue()
+    cancelled = threading.Event()
+    pool = ThreadPoolExecutor(max_workers=1)  # one worker keeps chunks in order
+    futures: list[Any] = []
+
+    def master_chunk(index: int, seg: np.ndarray) -> None:
+        if cancelled.is_set():
+            return
+        y = apply_mastering(seg, SAMPLE_RATE, params)
+        pcm = (np.clip(y, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+        events.put({
+            "type": "chunk",
+            "index": index,
+            "sample_rate": SAMPLE_RATE,
+            "pcm16": base64.b64encode(pcm).decode("ascii"),
+        })
+
+    def on_segment(seg: np.ndarray) -> None:
+        if cancelled.is_set():
+            raise _StreamCancelled()
+        # Master the preview on the side so the next sentence's inference isn't held up.
+        futures.append(pool.submit(master_chunk, len(futures), seg.copy()))
+
+    def work() -> None:
+        try:
+            result = _run_synthesis(req, prepared, on_segment=on_segment)
+            for f in futures:
+                f.result()
+            events.put({"type": "done", **result})
+        except _StreamCancelled:
+            pass
+        except HTTPException as exc:
+            events.put({"type": "error", "detail": exc.detail})
+        except Exception as exc:  # report rather than leave the client hanging
+            events.put({"type": "error", "detail": f"Synthesis failed: {exc}"})
+        finally:
+            pool.shutdown(wait=False)
+            events.put(None)
+
+    threading.Thread(target=work, daemon=True).start()
+
+    async def stream() -> Any:
+        # Poll rather than block, so a client that has gone away (new take, closed tab)
+        # is noticed and the worker stops instead of finishing an unwanted take.
+        try:
+            while True:
+                try:
+                    ev = events.get_nowait()
+                except queue.Empty:
+                    if await request.is_disconnected():
+                        return
+                    await asyncio.sleep(0.03)
+                    continue
+                if ev is None:
+                    return
+                yield json.dumps(ev) + "\n"
+        finally:
+            cancelled.set()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
 @app.post("/api/remaster")

@@ -832,6 +832,238 @@ function renderPresets() {
   finish();
 }
 
+// ---------- Play-as-it's-made preview ----------
+// While a take is being synthesized, the server streams each finished sentence and we
+// play it straight away through Web Audio. When the finished take arrives it is loaded
+// into the normal player in the background; the preview keeps playing to the end, and
+// pausing, seeking or switching to Raw hands over to the player at the same spot.
+
+const preview = {
+  ctx: null,
+  active: false,
+  final: false, // the finished take has arrived and is loaded in the player
+  items: [], // { src, at (context time), dur, tl (position in the take) }
+  pending: [], // AudioBuffers received but not yet scheduled (see PREVIEW_START_BUFFER_S)
+  nextAt: 0,
+  timeline: 0,
+  rafId: 0,
+};
+let waveformEmptyHtml = null;
+
+function setPreviewNote(text) {
+  const el = $("waveformEmpty");
+  if (waveformEmptyHtml === null) waveformEmptyHtml = el.innerHTML;
+  if (text) {
+    el.textContent = text;
+    el.classList.remove("hidden");
+  } else {
+    el.innerHTML = waveformEmptyHtml;
+    if (state.currentTake) el.classList.add("hidden");
+  }
+}
+
+function startPreview() {
+  stopPreview();
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return false;
+  // Created/resumed inside the click handler so the browser allows sound.
+  if (!preview.ctx) preview.ctx = new Ctx();
+  if (preview.ctx.state === "suspended") preview.ctx.resume().catch(() => {});
+  preview.active = true;
+  preview.final = false;
+  preview.items = [];
+  preview.pending = [];
+  preview.nextAt = 0;
+  preview.timeline = 0;
+  return true;
+}
+
+function stopPreview() {
+  if (!preview.active) return;
+  preview.active = false;
+  preview.final = false;
+  cancelAnimationFrame(preview.rafId);
+  preview.items.forEach((it) => {
+    try {
+      it.src.stop();
+    } catch (_) {}
+    it.src.disconnect();
+  });
+  preview.items = [];
+  preview.pending = [];
+  setPreviewNote(null);
+}
+
+function decodePcm16(b64) {
+  const bin = atob(b64);
+  const n = bin.length >> 1;
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let v = bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8);
+    if (v >= 32768) v -= 65536;
+    out[i] = v / 32768;
+  }
+  return out;
+}
+
+// A short opening line ("Hey, welcome back.") can finish playing before a long second
+// sentence is ready, leaving a gap. Hold playback until this much audio is in hand
+// (or the take is complete).
+const PREVIEW_START_BUFFER_S = 2.5;
+
+function queuePreviewChunk(chunk) {
+  if (!preview.active) return;
+  const ctx = preview.ctx;
+  const samples = decodePcm16(chunk.pcm16);
+  if (!samples.length) return;
+  const buf = ctx.createBuffer(1, samples.length, chunk.sample_rate);
+  buf.copyToChannel(samples, 0);
+  preview.pending.push(buf);
+  const buffered = preview.pending.reduce((s, b) => s + b.duration, 0);
+  if (preview.items.length || buffered >= PREVIEW_START_BUFFER_S) flushPreviewPending();
+}
+
+function flushPreviewPending() {
+  const bufs = preview.pending;
+  preview.pending = [];
+  bufs.forEach(schedulePreviewBuffer);
+}
+
+function schedulePreviewBuffer(buf) {
+  const ctx = preview.ctx;
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  // Back to back; if a sentence arrives late, start it as soon as possible.
+  const at = Math.max(preview.nextAt, ctx.currentTime + 0.06);
+  src.start(at);
+  preview.items.push({ src, at, dur: buf.duration, tl: preview.timeline });
+  preview.nextAt = at + buf.duration;
+  preview.timeline += buf.duration;
+
+  if (!preview.final) $("timeTotal").textContent = fmtTime(preview.timeline);
+  if (preview.items.length === 1) {
+    audioTuned.pause();
+    audioRaw.pause();
+    $("btnPlayPause").disabled = false;
+    updatePlayButtonUI(ctx.state === "running");
+    const canvas = $("waveformCanvas");
+    canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
+    setPreviewNote("Playing as it's made…");
+    cancelAnimationFrame(state.rafId);
+    cancelAnimationFrame(preview.rafId);
+    preview.rafId = requestAnimationFrame(previewTick);
+  }
+}
+
+// Position in the take being heard, or null once everything queued has played.
+function previewPosition() {
+  const now = preview.ctx.currentTime;
+  for (const it of preview.items) {
+    if (now < it.at) return it.tl; // waiting for a late sentence
+    if (now < it.at + it.dur) return it.tl + (now - it.at);
+  }
+  return null;
+}
+
+function previewTick() {
+  if (!preview.active) return;
+  const pos = previewPosition();
+  if (pos === null) {
+    if (preview.final) {
+      finishPreview();
+      return;
+    }
+    setPreviewNote("Still making the rest…");
+  } else {
+    $("timeCurrent").textContent = fmtTime(pos);
+    if (preview.final) drawWaveform();
+    else if (preview.items.length) setPreviewNote("Playing as it's made…");
+  }
+  preview.rafId = requestAnimationFrame(previewTick);
+}
+
+function finishPreview() {
+  stopPreview();
+  audioTuned.currentTime = 0;
+  $("timeCurrent").textContent = fmtTime(0);
+  updatePlayButtonUI(false);
+  drawWaveform();
+}
+
+// Called once the finished take is loaded in the player.
+function previewTakeArrived() {
+  preview.final = true;
+  setPreviewNote(null);
+  if (preview.ctx.state !== "running") {
+    handPreviewToPlayer(false); // paused: leave the player paused at the same spot
+  } else if (previewPosition() === null) {
+    finishPreview();
+  } else {
+    updatePlayButtonUI(true);
+  }
+}
+
+// Stop the preview and continue (or pause) in the normal player at the same spot.
+function handPreviewToPlayer(keepPlaying) {
+  if (!preview.active || !preview.final) return;
+  const pos = previewPosition();
+  const playing = keepPlaying && preview.ctx.state === "running" && pos !== null;
+  stopPreview();
+  audioTuned.currentTime = pos ?? 0;
+  $("timeCurrent").textContent = fmtTime(pos ?? 0);
+  if (playing) {
+    audioTuned.play().then(() => {
+      updatePlayButtonUI(true);
+      startPlaybackLoop();
+    }).catch(() => {});
+  } else {
+    updatePlayButtonUI(false);
+    drawWaveform();
+  }
+}
+
+// POST /api/synthesize-stream: play sentences as they come, resolve with the finished take.
+async function streamSynthesis(payload, signal, seq) {
+  const playable = startPreview();
+  const res = await fetch("/api/synthesize-stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || "Synthesis failed");
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line || seq !== state.synthSeq) continue;
+      const ev = JSON.parse(line);
+      if (ev.type === "chunk") {
+        if (playable) queuePreviewChunk(ev);
+      } else if (ev.type === "done") {
+        // A short script may finish before anything was played; then the finished take
+        // simply plays in the normal player.
+        delete ev.type;
+        return ev;
+      } else if (ev.type === "error") {
+        throw new Error(ev.detail || "Synthesis failed");
+      }
+    }
+  }
+  throw new Error("Synthesis stopped before the take was finished");
+}
+
 // ---------- Waveform Canvas & Playback ----------
 
 function drawWaveform() {
@@ -850,6 +1082,8 @@ function drawWaveform() {
 
   const take = state.currentTake;
   if (!take) return;
+  // While a new take is still streaming, the old take's waveform would be misleading.
+  if (preview.active && !preview.final) return;
 
   const isRaw = state.activeMode === "raw";
   const peaks = isRaw && take.raw_peaks ? take.raw_peaks : take.tuned_peaks;
@@ -857,7 +1091,8 @@ function drawWaveform() {
 
   const audio = getActiveAudio();
   const dur = audio.duration || (isRaw ? take.raw_duration : take.tuned_duration) || 1;
-  const progress = Math.min(1, Math.max(0, (audio.currentTime || 0) / dur));
+  const now = preview.active ? previewPosition() ?? dur : audio.currentTime || 0;
+  const progress = Math.min(1, Math.max(0, now / dur));
 
   const barCount = peaks.length;
   const gap = Math.max(1.5 * dpr, (w / barCount) * 0.3);
@@ -945,7 +1180,7 @@ function setActiveMode(mode, preservePlayhead = true) {
       nextAudio.play().catch(() => {});
       updatePlayButtonUI(true);
       startPlaybackLoop();
-    } else {
+    } else if (!preview.active) {
       updatePlayButtonUI(false);
     }
   };
@@ -1009,7 +1244,10 @@ function renderHistory() {
     const btn = document.createElement("button");
     btn.className = `history-pill ${state.currentTake && state.currentTake.take_id === item.take_id ? "active" : ""}`;
     btn.textContent = `#${state.history.length - idx} · ${item.label} (${item.tuned_duration.toFixed(1)}s)`;
-    btn.addEventListener("click", () => loadTake(item, false));
+    btn.addEventListener("click", () => {
+      stopPreview();
+      loadTake(item, false);
+    });
     pills.appendChild(btn);
   });
 }
@@ -1050,6 +1288,7 @@ async function synthesize(opts = {}) {
   const controller = new AbortController();
   state.synthAbort = controller;
   const seq = ++state.synthSeq;
+  stopPreview();
 
   const btn = $("btnSynthesize");
   if (!isLive) {
@@ -1067,6 +1306,7 @@ async function synthesize(opts = {}) {
   try {
     const isCb = state.engine === "chatterbox";
     let res;
+    let data = null;
     let canReuseRaw = false;
 
     if (isCb) {
@@ -1113,23 +1353,29 @@ async function synthesize(opts = {}) {
         include_raw: false,
       };
 
-      res = await fetch("/api/synthesize", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
+      if (isLive) {
+        // Slider-driven re-syncs swap the take in place at the same spot, so no preview.
+        res = await fetch("/api/synthesize", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+      } else {
+        data = await streamSynthesis(payload, controller.signal, seq);
+      }
     }
 
     if (seq !== state.synthSeq) return;
 
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.detail || "Synthesis failed");
+    if (!data) {
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || "Synthesis failed");
+      }
+      data = await res.json();
+      if (seq !== state.synthSeq) return;
     }
-
-    const data = await res.json();
-    if (seq !== state.synthSeq) return;
 
     if (isCb) {
       state.chatterboxStatus = "ready";
@@ -1236,12 +1482,19 @@ async function synthesize(opts = {}) {
     } else {
       state.history.unshift(data);
       if (state.history.length > 8) state.history.pop();
-      loadTake(data, true);
+      if (preview.active && preview.items.length) {
+        loadTake(data, false);
+        previewTakeArrived();
+      } else {
+        stopPreview();
+        loadTake(data, true);
+      }
     }
 
     setSyncStatus(false, `Live · ${(data.infer_ms / 1000).toFixed(2)}s`);
   } catch (err) {
     if (err.name === "AbortError") return;
+    if (seq === state.synthSeq) stopPreview();
     setSyncStatus(false, "Error");
     showToast(`Error: ${err.message}`);
   } finally {
@@ -1290,6 +1543,7 @@ async function runRemaster() {
     const data = await res.json();
     if (seq !== state.remasterSeq || !state.currentTake || state.currentTake.take_id !== takeId) return;
 
+    handPreviewToPlayer(true); // so the re-mastered audio carries on from the same spot
     const wasPlaying = state.activeMode === "tuned" && !audioTuned.paused && !audioTuned.ended;
     const pos = audioTuned.currentTime || 0;
 
@@ -1765,7 +2019,7 @@ function wireEvents() {
         "button, [role='button'], a[href], input, textarea, select, [contenteditable='true']"
       )
     ) {
-      if (state.currentTake) {
+      if (state.currentTake || preview.active) {
         e.preventDefault();
         togglePlayPause();
       }
@@ -1774,6 +2028,18 @@ function wireEvents() {
 
   // Playback controls
   const togglePlayPause = () => {
+    if (preview.active) {
+      if (preview.final) {
+        handPreviewToPlayer(false); // pause in the real player; Play resumes from here
+      } else if (preview.ctx.state === "running") {
+        preview.ctx.suspend().catch(() => {});
+        updatePlayButtonUI(false);
+      } else {
+        preview.ctx.resume().catch(() => {});
+        updatePlayButtonUI(true);
+      }
+      return;
+    }
     if (!state.currentTake) return;
     const audio = getActiveAudio();
     if (audio.paused || audio.ended) {
@@ -1788,8 +2054,13 @@ function wireEvents() {
   };
 
   $("btnPlayPause").addEventListener("click", togglePlayPause);
-  $("btnModeRaw").addEventListener("click", () => setActiveMode("raw", true));
-  $("btnModeTuned").addEventListener("click", () => setActiveMode("tuned", true));
+  const switchMode = (mode) => {
+    if (preview.active && !preview.final) return; // the new take isn't ready yet
+    handPreviewToPlayer(true);
+    setActiveMode(mode, true);
+  };
+  $("btnModeRaw").addEventListener("click", () => switchMode("raw"));
+  $("btnModeTuned").addEventListener("click", () => switchMode("tuned"));
 
   [audioTuned, audioRaw].forEach((el) => {
     el.addEventListener("ended", () => {
@@ -1801,6 +2072,8 @@ function wireEvents() {
   // Waveform scrub click
   $("waveformWrap").addEventListener("click", (e) => {
     if (!state.currentTake) return;
+    if (preview.active && !preview.final) return;
+    handPreviewToPlayer(true); // seeking continues in the real player
     const rect = $("waveformWrap").getBoundingClientRect();
     const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
     const audio = getActiveAudio();
