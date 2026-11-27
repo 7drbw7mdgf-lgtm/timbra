@@ -77,28 +77,12 @@ html, body {
   gap: 11px;
 }
 
-.brand-mark {
+.brand-logo {
   width: 32px;
   height: 32px;
-  border-radius: 9px;
-  background: linear-gradient(145deg, #242a38, #141822);
-  border: 1px solid rgba(245, 166, 35, 0.35);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 2.5px;
-  box-shadow: 0 0 18px rgba(245, 166, 35, 0.14);
+  flex-shrink: 0;
+  object-fit: contain;
 }
-
-.brand-mark .bar {
-  width: 3px;
-  border-radius: 2px;
-  background: var(--accent);
-}
-.brand-mark .b1 { height: 8px; opacity: 0.65; }
-.brand-mark .b2 { height: 16px; }
-.brand-mark .b3 { height: 12px; opacity: 0.85; }
-.brand-mark .b4 { height: 7px; opacity: 0.55; }
 
 .brand-title {
   font-weight: 700;

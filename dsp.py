@@ -86,20 +86,24 @@ def _envelope_follower(x: np.ndarray, fs: int, attack_ms: float, release_ms: flo
 
 
 def _apply_tube_warmth(x: np.ndarray, fs: int, amount: float) -> np.ndarray:
-    """Gentle broadcast preamp harmonic saturation (adds warm, slightly husky chestiness)."""
-    if amount <= 0.01:
+    """Broadcast-preamp style saturation of the 140 Hz - 4.8 kHz band.
+
+    The band is level-normalised before the tanh stage so the effect no longer depends on
+    how loud the dry take happens to be (Kokoro outputs around -26 dBFS, where tanh is
+    almost linear). An asymmetric bias adds even harmonics for the "warm" character.
+    """
+    if amount <= 0.01 or len(x) < 256:
         return x
-    # Split mid-band (140Hz - 4.5kHz) for gentle asymmetric even+odd harmonics
     nyq = fs * 0.5
     sos = signal.butter(2, [140.0 / nyq, min(4800.0 / nyq, 0.94)], btype="bandpass", output="sos")
     mid = signal.sosfilt(sos, x)
-    drive = 1.0 + 3.2 * amount
-    # Asymmetric soft-clipping introduces warm 2nd-order harmonics
-    sat = np.tanh(mid * drive + 0.12 * amount) - math.tanh(0.12 * amount)
-    sat /= drive * 0.85
-    mix = 0.38 * amount
-    return x + mix * (sat - mid)
-
+    ref = float(np.percentile(np.abs(mid), 99.5)) + 1e-9
+    m = mid / ref
+    drive = 1.0 + 2.5 * amount
+    bias = 0.15 * amount
+    sat = (np.tanh(m * drive + bias) - math.tanh(bias)) / math.tanh(drive)
+    mix = 0.55 * math.sqrt(amount)
+    return x + mix * (sat - m) * ref
 
 def _apply_formant_shift(x: np.ndarray, fs: int, shift_pct: float) -> np.ndarray:
     """Shift vocal tract spectral envelope independently of pitch via cepstral liftering."""
@@ -486,30 +490,37 @@ def _apply_vocal_smile_eq(x: np.ndarray, fs: int, smile: float) -> np.ndarray:
 
 
 def _apply_organic_jitter(x: np.ndarray, fs: int, amount: float) -> np.ndarray:
-    """Subtle vocal-fold micro-shimmer and micro-pitch drift (breaks flat synthetic stillness)."""
-    if amount <= 0.01 or len(x) < 1024:
+    """Slow random pitch drift (real resampling, so pitch genuinely wanders) plus amplitude shimmer.
+
+    Drift: a 0.5-3 Hz random curve, ~13 cents RMS at 20% and ~30 cents RMS at 100%.
+    Shimmer: 3-8 Hz random level movement, ~2.7% RMS at 20% and ~6% at 100%.
+    The overall length and average pitch of the take are unchanged.
+    """
+    if amount <= 0.01 or len(x) < 2048:
         return x
     n = len(x)
     rng = np.random.default_rng(307)
+    strength = math.sqrt(amount)
 
-    # 1. Slow organic amplitude shimmer (2 - 6 Hz random walk, max ±3.5% at 100%)
-    sos_slow = signal.butter(2, 5.5 / (fs * 0.5), btype="lowpass", output="sos")
-    shimmer = signal.sosfilt(sos_slow, rng.standard_normal(n))
-    shimmer /= float(np.std(shimmer) + 1e-8)
-    amp_mod = 1.0 + np.clip(shimmer * 0.022 * amount, -0.07, 0.07)
+    def smooth_noise(lo: float, hi: float) -> np.ndarray:
+        # Generate at a low control rate, then interpolate up: far cheaper than filtering at audio rate.
+        ctrl_fs = 200.0
+        m = int(n / fs * ctrl_fs) + 8
+        sos = signal.butter(2, [lo / (ctrl_fs / 2), hi / (ctrl_fs / 2)], btype="bandpass", output="sos")
+        v = signal.sosfiltfilt(sos, rng.standard_normal(m))
+        v /= float(np.std(v) + 1e-9)
+        return np.interp(np.arange(n) / fs * ctrl_fs, np.arange(m), v)
 
-    # 2. Ultra-subtle micro-pitch drift via smooth fractional sample warp (max ±0.45ms jitter)
-    sos_drift = signal.butter(2, 3.2 / (fs * 0.5), btype="lowpass", output="sos")
-    drift = signal.sosfilt(sos_drift, rng.standard_normal(n))
-    drift /= float(np.std(drift) + 1e-8)
-    max_shift_samples = (fs * 0.00042) * amount
-    idx = np.arange(n, dtype=np.float64) + np.clip(drift * max_shift_samples, -max_shift_samples * 2, max_shift_samples * 2)
-    idx = np.clip(idx, 0.0, n - 1.0001)
-    i0 = np.floor(idx).astype(int)
-    frac = idx - i0
+    cents = smooth_noise(0.5, 3.0) * 30.0 * strength
+    rate = 2.0 ** (cents / 1200.0)
+    pos = np.cumsum(rate) - rate[0]
+    pos *= (n - 1) / pos[-1]
+    i0 = np.clip(np.floor(pos).astype(int), 0, n - 2)
+    frac = pos - i0
     warped = (1.0 - frac) * x[i0] + frac * x[i0 + 1]
-    return warped * amp_mod
 
+    shimmer = 1.0 + smooth_noise(3.0, 8.0) * 0.06 * strength
+    return warped * shimmer
 
 def _apply_vocal_fry(
     x: np.ndarray,
@@ -517,7 +528,13 @@ def _apply_vocal_fry(
     amount: float,
     regions: list[tuple[int, int]] | None = None,
 ) -> np.ndarray:
-    """Add subtle relaxed low-frequency glottal creak at the trailing tails of phrases."""
+    """Creaky phrase endings: gate the last 180-300 ms of each phrase with an irregular,
+    sharp glottal-pulse train at 35-60 Hz, fading in toward the end.
+
+    Real vocal fry is a slow, irregular train of distinct glottal pulses; sharp pulses with
+    jittered periods give that "rattle", where a smooth sine-like wobble (the old version)
+    only sounded like a faint tremolo.
+    """
     if amount <= 0.01 or len(x) < int(fs * 0.4):
         return x
     if regions is None:
@@ -527,25 +544,27 @@ def _apply_vocal_fry(
 
     out = x.copy()
     rng = np.random.default_rng(409)
+    depth = min(0.92, 0.95 * math.sqrt(amount))
     for start, end in regions:
         seg_len = end - start
         if seg_len < int(fs * 0.45):
             continue
-        # Target the last 130 - 210ms of the phrase tail
-        tail_n = min(int(fs * rng.uniform(0.13, 0.21)), seg_len // 3)
+        tail_n = min(int(fs * rng.uniform(0.18, 0.30)), seg_len // 3)
         t_start = end - tail_n
-        t = np.arange(tail_n, dtype=np.float64) / fs
-        # Irregular glottal pulse train around 48 - 66 Hz
-        freq = float(rng.uniform(48.0, 65.0))
-        phase = 2.0 * np.pi * freq * t + 0.6 * np.sin(2.0 * np.pi * 7.5 * t)
-        # Soft pulsing modulation (dips amplitude gently like relaxed glottal fry)
-        pulses = 0.5 + 0.5 * np.cos(phase)
-        fry_depth = 0.42 * amount
-        fade_in = np.linspace(0.0, 1.0, tail_n) ** 1.5
-        mod = 1.0 - fade_in * fry_depth * (1.0 - pulses ** 2.2)
+
+        pulses = np.zeros(tail_n)
+        base_period = fs / rng.uniform(35.0, 60.0)
+        tau = fs * 0.004
+        k = 0.0
+        while k < tail_n:
+            i = int(k)
+            length = min(tail_n - i, int(base_period * 1.6))
+            pulses[i : i + length] = np.maximum(pulses[i : i + length], np.exp(-np.arange(length) / tau))
+            k += base_period * rng.uniform(0.75, 1.30)  # irregular spacing is what makes it creak
+        ramp = np.linspace(0.0, 1.0, tail_n) ** 1.3
+        mod = 1.0 - ramp * depth * (1.0 - pulses)
         out[t_start:end] = out[t_start:end] * mod
     return out
-
 
 def _apply_room_floor(x: np.ndarray, fs: int, amount: float) -> np.ndarray:
     """Replace sterile digital zero silence with subtle warm studio room-tone floor."""
