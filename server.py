@@ -312,6 +312,32 @@ def _fade_edges(seg: np.ndarray, sr: int, ms: float = 5.0) -> np.ndarray:
     return out
 
 
+def _trim_silence(
+    seg: np.ndarray, sr: int, floor_db: float = -42.0, lead_ms: float = 40.0, tail_ms: float = 80.0
+) -> np.ndarray:
+    """Trim the model's own leading/trailing silence from a generated sentence.
+
+    Each sentence is synthesized separately and the engines pad both ends with
+    ~0.3 s of near-silence. Without trimming, that padding stacks with the
+    explicit sentence pause and leaves ~1 s gaps between sentences. A short
+    lead-in and a slightly longer tail are kept so onsets and decays stay natural.
+    """
+    if len(seg) < sr // 10:
+        return seg
+    frame = max(1, int(sr * 0.01))
+    n_frames = len(seg) // frame
+    if n_frames < 3:
+        return seg
+    rms = np.sqrt(np.mean(seg[: n_frames * frame].reshape(n_frames, frame) ** 2, axis=1)) + 1e-9
+    level_db = 20.0 * np.log10(rms / (rms.max() + 1e-9))
+    voiced = np.flatnonzero(level_db > floor_db)
+    if len(voiced) == 0:
+        return seg
+    start = max(0, voiced[0] * frame - int(sr * lead_ms / 1000.0))
+    end = min(len(seg), (voiced[-1] + 1) * frame + int(sr * tail_ms / 1000.0))
+    return seg[start:end]
+
+
 def _phonemize_cached(text: str, lang: str) -> str:
     """Cached espeak phonemization so slider tweaks spend 0 ms re-phonemizing."""
     assert kokoro is not None
@@ -451,7 +477,7 @@ def _synthesize_paragraphs(
                 clause_pause=clause_pause,
             )
             if len(seg) > 0:
-                segments.append(_fade_edges(seg, SAMPLE_RATE, ms=5.0))
+                segments.append(_fade_edges(_trim_silence(seg, SAMPLE_RATE), SAMPLE_RATE, ms=5.0))
             if j < len(sentences) - 1 and sentence_pause > 0:
                 pause_scale = 1.0 + float(rng.uniform(-0.36, 0.42)) * rh
                 if sent.endswith("?"):
@@ -1242,7 +1268,7 @@ def synthesize_chatterbox(req: ChatterboxSynthesizeRequest) -> dict[str, Any]:
                 ]
                 if gen_parts:
                     seg = np.concatenate(gen_parts)
-                    segments.append(_fade_edges(seg, sr, ms=6.0))
+                    segments.append(_fade_edges(_trim_silence(seg, sr), sr, ms=6.0))
                 if s_idx < len(sentences) - 1 and req.sentence_pause > 0:
                     p_scale = 1.0 + float(rng.uniform(-0.34, 0.40)) * rh
                     sp_n = int(round(max(0.06, req.sentence_pause * p_scale) * sr))
@@ -1554,7 +1580,7 @@ def openai_audio_speech(req: OpenAISpeechRequest) -> Response:
                             )
                         ]
                         if parts:
-                            segs.append(_fade_edges(np.concatenate(parts), sr, ms=6.0))
+                            segs.append(_fade_edges(_trim_silence(np.concatenate(parts), sr), sr, ms=6.0))
                         if si < len(sents) - 1 and sent_p > 0:
                             segs.append(np.zeros(int(sent_p * sr), dtype=np.float32))
                     if pi < len(para_chunks) - 1 and para_p > 0:
