@@ -101,12 +101,13 @@
 
           <textarea
             id="scriptInput"
+            aria-label="Script to speak"
             class="script-textarea"
             rows="6"
             placeholder="Type or paste what you want Kokoro to say…"
           >Hey, welcome back. Today we're testing how close a tiny local model can get to a real studio voice — warm, unhurried, and genuinely conversational.
 
-Listen closely to the phrasing, the subtle breath between thoughts, and the softness on the high frequencies. When you dial in the blend and mastering chain just right, the difference is night and day.</textarea>
+Listen closely to the phrasing, the subtle breath between thoughts, and the softness on the high frequencies. When you dial in the blend and mastering chain just right, you'll hear the difference.</textarea>
 
           <div class="script-footer">
             <div class="script-meta">
@@ -139,6 +140,7 @@ Listen closely to the phrasing, the subtle breath between thoughts, and the soft
             </div>
             <textarea
               id="phonemeInput"
+              aria-label="IPA phonemes"
               class="phoneme-textarea"
               rows="3"
               placeholder="Click 'Refresh IPA' or synthesize to inspect exact phonemes…"
@@ -687,7 +689,7 @@ Listen closely to the phrasing, the subtle breath between thoughts, and the soft
 
   <!-- Save Preset Modal -->
   <div class="modal-backdrop hidden" id="presetModal">
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true">
       <div class="modal-head">
         <h3>Save Custom Preset</h3>
         <button class="icon-close" data-close-modal="presetModal">&times;</button>
@@ -709,7 +711,7 @@ Listen closely to the phrasing, the subtle breath between thoughts, and the soft
 
   <!-- Export Voice for Apps Modal -->
   <div class="modal-backdrop hidden" id="codeModal">
-    <div class="modal modal-xl">
+    <div class="modal modal-xl" role="dialog" aria-modal="true">
       <div class="modal-head">
         <div>
           <h3>Export Voice for Apps</h3>
@@ -765,7 +767,7 @@ Listen closely to the phrasing, the subtle breath between thoughts, and the soft
 
   <!-- Match Reference Audio Modal -->
   <div class="modal-backdrop hidden" id="matchModal">
-    <div class="modal modal-lg">
+    <div class="modal modal-lg" role="dialog" aria-modal="true">
       <div class="modal-head">
         <h3>Match Reference Voice Style</h3>
         <button class="icon-close" data-close-modal="matchModal">&times;</button>

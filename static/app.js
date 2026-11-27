@@ -54,7 +54,7 @@ const CHATTERBOX_PRESETS = [
 
 const SAMPLE_SCRIPTS = {
   podcast:
-    "Hey, welcome back. Today we're testing how close a tiny local model can get to a real studio voice — warm, unhurried, and genuinely conversational.\n\nListen closely to the phrasing, the subtle breath between thoughts, and the softness on the high frequencies. When you dial in the blend and mastering chain just right, the difference is night and day.",
+    "Hey, welcome back. Today we're testing how close a tiny local model can get to a real studio voice — warm, unhurried, and genuinely conversational.\n\nListen closely to the phrasing, the subtle breath between thoughts, and the softness on the high frequencies. When you dial in the blend and mastering chain just right, you'll hear the difference.",
   conversational:
     "Honestly? I wasn't expecting it to sound this natural on a laptop. Once you slow the pacing down just a touch and blend two complementary voices together, all of that robotic sharpness kind of melts away.",
   story:
@@ -457,6 +457,7 @@ function renderReferences() {
     updateLiveSummary();
     scheduleLiveSynthesize(400);
   });
+  makePressable(defItem, !state.activeRefId);
   list.appendChild(defItem);
 
   state.references.forEach((ref) => {
@@ -482,6 +483,8 @@ function renderReferences() {
       updateLiveSummary();
       scheduleLiveSynthesize(400);
     });
+    makePressable(row, state.activeRefId === ref.id);
+    row.setAttribute("aria-label", `Use reference voice ${ref.name}`);
     row.querySelector(".ref-play-btn").addEventListener("click", (e) => {
       e.stopPropagation();
       audioRefPreview.src = ref.audio_url;
@@ -604,11 +607,11 @@ function renderBlendUI() {
     div.innerHTML = `
       <div class="slot-top">
         <span class="slot-color" style="background:${color}"></span>
-        <select class="slot-select">${buildVoiceOptionsHtml(slot.voice)}</select>
+        <select class="slot-select" aria-label="Blend voice ${idx + 1}">${buildVoiceOptionsHtml(slot.voice)}</select>
         <span class="slot-pct">${pct}%</span>
-        ${state.blend.length > 1 ? `<button class="slot-remove" title="Remove voice">&times;</button>` : ""}
+        ${state.blend.length > 1 ? `<button class="slot-remove" title="Remove voice" aria-label="Remove blend voice ${idx + 1}">&times;</button>` : ""}
       </div>
-      <input type="range" class="slot-weight" min="0.05" max="1" step="0.05" value="${slot.weight}" />
+      <input type="range" class="slot-weight" aria-label="Blend voice ${idx + 1} weight" min="0.05" max="1" step="0.05" value="${slot.weight}" />
       <div class="slot-desc">${meta ? `${meta.accent} ${meta.gender} — ${meta.description}` : ""}</div>
     `;
 
@@ -672,9 +675,9 @@ function renderRulesUI() {
     const row = document.createElement("div");
     row.className = "rule-row";
     row.innerHTML = `
-      <input type="text" class="text-input rule-find" placeholder="Word (e.g. Kokoro)" value="${escapeAttr(rule.find)}" />
+      <input type="text" class="text-input rule-find" aria-label="Word to replace" placeholder="Word (e.g. Kokoro)" value="${escapeAttr(rule.find)}" />
       <span class="rule-arrow">→</span>
-      <input type="text" class="text-input rule-replace" placeholder="Say as (e.g. Ko-ko-ro)" value="${escapeAttr(rule.replace)}" />
+      <input type="text" class="text-input rule-replace" aria-label="Say it as" placeholder="Say as (e.g. Ko-ko-ro)" value="${escapeAttr(rule.replace)}" />
       <button class="slot-remove" title="Delete rule">&times;</button>
     `;
     row.querySelector(".rule-find").addEventListener("input", (e) => {
@@ -733,9 +736,39 @@ function applyChatterboxPreset(p) {
   syncSliderReadouts();
 }
 
+// Make a non-button element behave like a button for keyboard users.
+function makePressable(el, pressed) {
+  el.tabIndex = 0;
+  el.setAttribute("role", "button");
+  if (pressed !== undefined) el.setAttribute("aria-pressed", pressed ? "true" : "false");
+  el.addEventListener("keydown", (e) => {
+    if (e.target !== el) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      el.click();
+    }
+  });
+}
+
+// Fade the preset ribbon's edges when presets are scrolled out of view.
+function updatePresetFades() {
+  const list = $("presetsList");
+  const max = list.scrollWidth - list.clientWidth;
+  list.classList.toggle("fade-left", max > 1 && list.scrollLeft > 1);
+  list.classList.toggle("fade-right", max > 1 && list.scrollLeft < max - 1);
+}
+
 function renderPresets() {
   const list = $("presetsList");
+  const refocusId = list.contains(document.activeElement) ? document.activeElement.dataset.presetId : null;
   list.innerHTML = "";
+  const finish = () => {
+    if (refocusId) {
+      const again = [...list.querySelectorAll(".preset-pill")].find((el) => el.dataset.presetId === refocusId);
+      if (again) again.focus();
+    }
+    updatePresetFades();
+  };
 
   if (state.engine === "chatterbox") {
     CHATTERBOX_PRESETS.forEach((p) => {
@@ -743,6 +776,8 @@ function renderPresets() {
       btn.className = `preset-pill ${p.id === state.activeCbPresetId ? "active" : ""}`;
       btn.title = p.description || p.name;
       btn.innerHTML = `<span>${escapeAttr(p.name)}</span><span class="preset-tag">${escapeAttr(p.tag)}</span>`;
+      btn.dataset.presetId = p.id;
+      makePressable(btn, p.id === state.activeCbPresetId);
       btn.addEventListener("click", () => {
         state.activeCbPresetId = p.id;
         applyChatterboxPreset(p);
@@ -755,6 +790,7 @@ function renderPresets() {
       });
       list.appendChild(btn);
     });
+    finish();
     return;
   }
 
@@ -765,8 +801,10 @@ function renderPresets() {
     btn.innerHTML = `
       <span>${escapeAttr(p.name)}</span>
       <span class="preset-tag">${escapeAttr(p.tag || "Preset")}</span>
-      ${!p.builtin ? `<button class="preset-del" title="Delete preset">&times;</button>` : ""}
+      ${!p.builtin ? `<button class="preset-del" title="Delete preset" aria-label="Delete preset ${escapeAttr(p.name)}">&times;</button>` : ""}
     `;
+    btn.dataset.presetId = p.id;
+    makePressable(btn, p.id === state.activePresetId);
     btn.addEventListener("click", (e) => {
       if (e.target.classList.contains("preset-del")) return;
       state.activePresetId = p.id;
@@ -791,6 +829,7 @@ function renderPresets() {
     }
     list.appendChild(btn);
   });
+  finish();
 }
 
 // ---------- Waveform Canvas & Playback ----------
@@ -1385,6 +1424,8 @@ function renderExportedVoices() {
       renderExportedVoices();
       renderExportSnippet();
     });
+    makePressable(row, v.slug === state.selectedExportSlug);
+    row.setAttribute("aria-label", `Show API snippet for ${v.name}`);
 
     row.querySelector(".exp-load-btn").addEventListener("click", (e) => {
       e.stopPropagation();
@@ -1720,7 +1761,9 @@ function wireEvents() {
       synthesize();
     } else if (
       e.code === "Space" &&
-      !["TEXTAREA", "INPUT", "SELECT"].includes(document.activeElement.tagName)
+      !document.activeElement?.closest(
+        "button, [role='button'], a[href], input, textarea, select, [contenteditable='true']"
+      )
     ) {
       if (state.currentTake) {
         e.preventDefault();
@@ -2036,6 +2079,29 @@ function wireEvents() {
   document.querySelectorAll("[data-close-modal]").forEach((btn) => {
     btn.addEventListener("click", () => $(btn.dataset.closeModal).classList.add("hidden"));
   });
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    const open = [...document.querySelectorAll(".modal-backdrop")].filter((m) => !m.classList.contains("hidden"));
+    if (open.length) {
+      e.preventDefault();
+      open[open.length - 1].classList.add("hidden");
+    }
+  });
+
+  // Preset ribbon: edge fades + vertical wheel scrolls it sideways
+  const presetRow = $("presetsList");
+  presetRow.addEventListener("scroll", updatePresetFades, { passive: true });
+  window.addEventListener("resize", updatePresetFades);
+  presetRow.addEventListener(
+    "wheel",
+    (e) => {
+      if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+      if (presetRow.scrollWidth <= presetRow.clientWidth) return;
+      e.preventDefault();
+      presetRow.scrollLeft += e.deltaY;
+    },
+    { passive: false }
+  );
 
   $("btnSavePreset").addEventListener("click", () => {
     $("presetNameInput").value = "";
